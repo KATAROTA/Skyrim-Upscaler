@@ -44,7 +44,7 @@ jobs:
         run: |
           cmake --preset skyrim `
             "-DUPSCALER_COMMONLIB_SOURCE=$env:GITHUB_WORKSPACE/CommonLibSSE-NG" `
-            -DSKSE_SUPPORT_PATCH_SAFETY=OFF
+            -DSKSE_SUPPORT_PATCH_SAFETY=ON
 
       - name: Build Release
         shell: pwsh
