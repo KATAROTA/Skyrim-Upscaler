@@ -39,12 +39,14 @@ HRESULT WINAPI hk_IDXGISwapChain_Present(IDXGISwapChain* This, UINT SyncInterval
 	SettingGUI::GetSingleton()->OnRender();
 	auto hr = (This->*ptrPresent)(SyncInterval, Flags);
 	DRS::GetSingleton()->Update();
-	return 0;
+	return hr;
 }
 
 HRESULT WINAPI hk_ID3D11Device_CreateTexture2D(ID3D11Device* This, const D3D11_TEXTURE2D_DESC* pDesc, const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D)
 {
 	auto hr = (This->*ptrCreateTexture2D)(pDesc, pInitialData, ppTexture2D);
+	if (FAILED(hr) || pDesc == nullptr || ppTexture2D == nullptr || *ppTexture2D == nullptr)
+		return hr;
 	static bool locking = false;
 	if (locking)
 		return hr;
@@ -204,6 +206,8 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
 	D3D_FEATURE_LEVEL*          pFeatureLevel,
 	ID3D11DeviceContext**       ppImmediateContext)
 {
+	if (pSwapChainDesc == nullptr)
+		return E_INVALIDARG;
 	DXGI_SWAP_CHAIN_DESC sDesc;
 	if (REL::Module::IsVR()) {
 		memcpy(&sDesc, pSwapChainDesc, sizeof(DXGI_SWAP_CHAIN_DESC));
@@ -227,11 +231,23 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
 		pFeatureLevel,
 		ppImmediateContext);
 
+	if (FAILED(hr) || ppSwapChain == nullptr || ppDevice == nullptr ||
+		ppImmediateContext == nullptr || *ppSwapChain == nullptr ||
+		*ppDevice == nullptr || *ppImmediateContext == nullptr) {
+		logger::error("D3D11CreateDeviceAndSwapChain failed: HRESULT 0x{:08X}", static_cast<unsigned int>(hr));
+		return FAILED(hr) ? hr : E_FAIL;
+	}
+
 	auto device = *ppDevice;
 	auto deviceContext = *ppImmediateContext;
 	auto swapChain = *ppSwapChain;
-	SkyrimUpscaler::GetSingleton()->SetupSwapChain(swapChain);
-	SkyrimUpscaler::GetSingleton()->PreInit();
+	auto* upscaler = SkyrimUpscaler::GetSingleton();
+	upscaler->SetupSwapChain(swapChain);
+	if (upscaler->mDevice == nullptr || upscaler->mContext == nullptr) {
+		logger::error("Could not initialize the Direct3D 11 device/context");
+		return E_FAIL;
+	}
+	upscaler->PreInit();
 	SettingGUI::GetSingleton()->InitIMGUI(swapChain, device, deviceContext);
 	InitLogDelegate(MyLog);
 	logger::info("Detouring virtual function tables");
@@ -350,14 +366,23 @@ struct UpscalerHooks
 
 	static void Install()
 	{
-		// Hook for getting the swapchain
-		// Nope, depth and motion texture are already created after this function, so can't use it
+		// Validate Direct3D entry points before modifying the Skyrim executable.
+		auto dllD3D11 = GetModuleHandleA("d3d11.dll");
+		if (dllD3D11 == nullptr) {
+			logger::error("Cannot install upscaler hooks: d3d11.dll is not loaded");
+			return;
+		}
+		auto createDevice = GetProcAddress(dllD3D11, "D3D11CreateDeviceAndSwapChain");
+		if (createDevice == nullptr) {
+			logger::error("Cannot install upscaler hooks: D3D11CreateDeviceAndSwapChain not found");
+			return;
+		}
+		// Hook for getting the swapchain.
 		stl::write_thunk_call<BSGraphics_Renderer_Init_InitD3D>(REL::RelocationID(75595, 77226).address() + REL::Relocate(0x50, 0x2BC));
 		// Have to hook the creation of SwapChain to hook CreateTexture2D before depth and motion textures are created
 		char* ptr = nullptr;
 		auto  moduleBase = (uintptr_t)GetModuleHandle(ptr);
-		auto  dllD3D11 = GetModuleHandleA("d3d11.dll");
-		*(FARPROC*)&ptrD3D11CreateDeviceAndSwapChain = GetProcAddress(dllD3D11, "D3D11CreateDeviceAndSwapChain");
+		*(FARPROC*)&ptrD3D11CreateDeviceAndSwapChain = createDevice;
 		Detours::IATHook(moduleBase, "d3d11.dll", "D3D11CreateDeviceAndSwapChain", (uintptr_t)hk_D3D11CreateDeviceAndSwapChain);
 		 
 		// Setup our own jitters

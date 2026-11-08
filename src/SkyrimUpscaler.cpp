@@ -80,9 +80,13 @@ void SkyrimUpscaler::MessageHandler(SKSE::MessagingInterface::Message* a_msg)
 void SkyrimUpscaler::SetupSwapChain(IDXGISwapChain* swapchain)
 {
 	mSwapChain = swapchain;
-	mSwapChain->GetDevice(IID_PPV_ARGS(&mDevice));
+	if (FAILED(mSwapChain->GetDevice(IID_PPV_ARGS(&mDevice))) || mDevice == nullptr) {
+		logger::error("IDXGISwapChain::GetDevice failed");
+		return;
+	}
 	mDevice->GetImmediateContext(&mContext);
-	SetupDirectX(mDevice, 0);
+	if (mContext == nullptr || !SetupDirectX(mDevice, 0))
+		logger::error("Direct3D upscaler initialization failed");
 }
 
 float SkyrimUpscaler::GetVerticalFOVRad()
@@ -101,7 +105,9 @@ void SkyrimUpscaler::EvaluateUpscaler(ID3D11Texture2D* source)
 	static bool        lastEnable = false;
 
 	if (mSwapChain != nullptr) {
-		if (mTargetTex.mImage != nullptr && mDepthBuffer.mImage != nullptr && mMotionVectors.mImage != nullptr) {
+		if (mContext != nullptr && mTempColor.mImage != nullptr &&
+			mMotionVectorsEmpty.mImage != nullptr && mTargetTex.mImage != nullptr &&
+			mDepthBuffer.mImage != nullptr && mMotionVectors.mImage != nullptr) {
 			ID3D11Texture2D* transparentMask = (mEnableTransparentMask ? mTransparentMask.mImage : nullptr);
 			bool             enable = IsEnabled();
 			bool             delayOneFrame = false && (lastEnable && !enable);
@@ -148,7 +154,7 @@ void SkyrimUpscaler::SetMotionScale(float x, float y)
 	mMotionScale[0] = x;
 	mMotionScale[1] = y;
 	SetMotionScaleX(0, x);
-	SetMotionScaleX(0, y);
+	SetMotionScaleY(0, y);
 }
 
 void SkyrimUpscaler::SetEnabled(bool enabled)
@@ -195,7 +201,22 @@ void SkyrimUpscaler::SetupMotionVector(ID3D11Texture2D* motion_buffer)
 	if (!mMotionVectorsEmpty.mImage) {
 		D3D11_TEXTURE2D_DESC desc;
 		motion_buffer->GetDesc(&desc);
-		mDevice->CreateTexture2D(&desc, NULL, &mMotionVectorsEmpty.mImage);
+		if (FAILED(mDevice->CreateTexture2D(&desc, nullptr, &mMotionVectorsEmpty.mImage)) ||
+			mMotionVectorsEmpty.mImage == nullptr) {
+			logger::error("Unable to allocate motion-vector clearing texture");
+			return;
+		}
+		ID3D11RenderTargetView* rtv = nullptr;
+		if (SUCCEEDED(mDevice->CreateRenderTargetView(mMotionVectorsEmpty.mImage, nullptr, &rtv)) && rtv) {
+			constexpr float black[4] = { 0.f, 0.f, 0.f, 0.f };
+			mContext->ClearRenderTargetView(rtv, black);
+			rtv->Release();
+		} else {
+			logger::error("Unable to clear motion-vector texture");
+			mMotionVectorsEmpty.mImage->Release();
+			mMotionVectorsEmpty.mImage = nullptr;
+			return;
+		}
 		mDisplaySizeX = desc.Width;
 		mDisplaySizeY = desc.Height;
 	}
@@ -206,9 +227,13 @@ void SkyrimUpscaler::PreInit()
 	LoadINI();
 	if (!REL::Module::IsVR()) {
 		ID3D11Texture2D* back_buffer;
-		mSwapChain->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
+		if (FAILED(mSwapChain->GetBuffer(0, IID_PPV_ARGS(&back_buffer))) || back_buffer == nullptr) {
+			logger::error("Could not obtain backbuffer during PreInit");
+			return;
+		}
 		D3D11_TEXTURE2D_DESC desc;
 		back_buffer->GetDesc(&desc);
+		back_buffer->Release();
 		mDisplaySizeX = desc.Width;
 		mDisplaySizeY = desc.Height;
 	}
@@ -218,8 +243,13 @@ void SkyrimUpscaler::InitUpscaler()
 {
 	D3D11_TEXTURE2D_DESC desc;
 	ID3D11Texture2D*     back_buffer;
-	mSwapChain->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
+	if (mSwapChain == nullptr || FAILED(mSwapChain->GetBuffer(0, IID_PPV_ARGS(&back_buffer))) ||
+		back_buffer == nullptr) {
+		logger::error("Could not obtain backbuffer during InitUpscaler");
+		return;
+	}
 	back_buffer->GetDesc(&desc);
+	back_buffer->Release();
 	if (REL::Module::IsVR()) {
 		desc.Width = mDisplaySizeX;
 		desc.Height = mDisplaySizeY;
@@ -236,8 +266,13 @@ void SkyrimUpscaler::InitUpscaler()
 			SetEnabled(false);
 			return;
 		}
-		if (!mTempColor.mImage)
-			mDevice->CreateTexture2D(&desc, NULL, &mTempColor.mImage);
+		if (!mTempColor.mImage &&
+			(FAILED(mDevice->CreateTexture2D(&desc, nullptr, &mTempColor.mImage)) ||
+			 mTempColor.mImage == nullptr)) {
+			logger::error("Unable to create upscaler source texture");
+			SetEnabled(false);
+			return;
+		}
 		if (mUpscaleType == DLAA) {
 			mRenderSizeX = mDisplaySizeX;
 			mRenderSizeY = mDisplaySizeY;

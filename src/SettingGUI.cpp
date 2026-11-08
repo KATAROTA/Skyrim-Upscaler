@@ -73,9 +73,6 @@ void SettingGUI::OnRender()
 		ProcessEvent(static_cast<ImGuiKey>(mToggleHotkey));
 	}
 	
-	if (ImGui::IsKeyReleased(static_cast<ImGuiKey>(mToggleHotkey)))
-		toggle();
-
 	auto&  io = ImGui::GetIO();
 	io.MouseDrawCursor = mShowGUI;
 
@@ -83,6 +80,8 @@ void SettingGUI::OnRender()
 	ImGui_ImplDX11_NewFrame();
 	ImGui_ImplWin32_NewFrame();
 	ImGui::NewFrame();
+	if (ImGui::IsKeyReleased(static_cast<ImGuiKey>(mToggleHotkey)))
+		toggle();
 
 	if (!REL::Module::IsVR()) {
 		static bool lastShowGUI = false;
