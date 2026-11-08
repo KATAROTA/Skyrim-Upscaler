@@ -77,7 +77,7 @@ std::string GetLibraryPath(std::string filename)
 	return (std::string(path).substr(0, pos) + "/../../UpscalerBasePlugin/" + filename);
 }
 
-EXTERN_C [[maybe_unused]] __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadInterface* a_skse)
+EXTERN_C [[maybe_unused]] __declspec(dllexport) bool __cdecl SKSEPlugin_Load(const SKSE::LoadInterface* a_skse)
 {
 #ifndef NDEBUG
 	while (!IsDebuggerPresent()) {};
@@ -111,7 +111,7 @@ EXTERN_C [[maybe_unused]] __declspec(dllexport) constinit auto SKSEPlugin_Versio
 	return v;
 }();
 
-EXTERN_C [[maybe_unused]] __declspec(dllexport) bool SKSEAPI SKSEPlugin_Query(const SKSE::QueryInterface*, SKSE::PluginInfo* pluginInfo)
+EXTERN_C [[maybe_unused]] __declspec(dllexport) bool __cdecl SKSEPlugin_Query(const SKSE::QueryInterface*, SKSE::PluginInfo* pluginInfo)
 {
 	pluginInfo->name = SKSEPlugin_Version.pluginName;
 	pluginInfo->infoVersion = SKSE::PluginInfo::kVersion;
