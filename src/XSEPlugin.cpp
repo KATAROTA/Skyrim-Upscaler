@@ -6,6 +6,11 @@
 #include <DRS.h>
 #include <SkyrimUpscaler.h>
 
+#include <array>
+#include <cstdint>
+#include <cstring>
+
+
 static void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
 {
 	switch (a_msg->type) {
@@ -18,6 +23,69 @@ static void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
 	}
 	DRS::GetSingleton()->MessageHandler(a_msg);
 	SkyrimUpscaler::GetSingleton()->MessageHandler(a_msg);
+}
+
+
+namespace
+{
+    template <std::size_t N>
+    bool VerifyHookBytes(
+        const char* name,
+        std::uintptr_t address,
+        const std::array<std::uint8_t, N>& expected)
+    {
+        if (address == 0 ||
+            std::memcmp(
+                reinterpret_cast<const void*>(address),
+                expected.data(),
+                expected.size()) != 0) {
+            logger::error("Hook verification FAILED: {} at 0x{:X}", name, address);
+            return false;
+        }
+
+        logger::info("Hook verification OK: {}", name);
+        return true;
+    }
+
+    bool VerifyRuntimeHooks()
+    {
+        bool valid = true;
+
+        auto require = [&](const char* name, std::uintptr_t address, auto expected) {
+            if (!VerifyHookBytes(name, address, expected)) {
+                valid = false;
+            }
+        };
+
+        require("Renderer Init",
+            REL::RelocationID(75595, 77226).address() + 0x2BC,
+            std::array<std::uint8_t, 5>{0xE8, 0x9F, 0x2D, 0x02, 0x00});
+
+        require("UpdateJitter",
+            REL::RelocationID(75460, 77245).address() + 0x133,
+            std::array<std::uint8_t, 5>{0xE8, 0xF8, 0x44, 0x01, 0x00});
+
+        require("Jitter NOP",
+            REL::RelocationID(75709, 77518).address() + 0x11,
+            std::array<std::uint8_t, 6>{0x80, 0x7A, 0x18, 0x00, 0x74, 0x72});
+
+        require("Camera NOP",
+            REL::RelocationID(75711, 77520).address() + 0x1D6,
+            std::array<std::uint8_t, 10>{
+                0x80, 0x79, 0x18, 0x00, 0x0F,
+                0x84, 0xD4, 0x00, 0x00, 0x00
+            });
+
+        require("MainDraw",
+            REL::RelocationID(79947, 82084).address() + 0x17A,
+            std::array<std::uint8_t, 5>{0xE8, 0x51, 0xF2, 0xE9, 0xFF});
+
+        require("DRS",
+            REL::RelocationID(35556, 36555).address() + 0x2D,
+            std::array<std::uint8_t, 5>{0xE8, 0x4E, 0x7B, 0x9C, 0x00});
+
+        return valid;
+    }
 }
 
 void Init()
@@ -101,6 +169,11 @@ EXTERN_C [[maybe_unused]] __declspec(dllexport) bool __cdecl SKSEPlugin_Load(con
 
 	if (REL::Module::get().version() != REL::Version{ 1, 7, 104, 0 }) {
 		logger::error("Unsupported Skyrim runtime; expected 1.7.104.0");
+		return false;
+	}
+
+	if (!VerifyRuntimeHooks()) {
+		logger::error("Hook verification failed; refusing to load");
 		return false;
 	}
 
