@@ -10,15 +10,24 @@
         "plugin": {
             "description": "Build the SKSE plugin.",
             "dependencies": [
-                "commonlibsse-ng",
                 "nlohmann-json",
                 "simpleini",
                 "magic-enum",
                 {
                     "name": "imgui",
-                    "features": ["dx11-binding", "win32-binding"],
+                    "features": [
+                        "dx11-binding",
+                        "win32-binding"
+                    ],
                     "version>=": "1.88"
-                }
+                },
+                "directxmath",
+                "directxtk",
+                "fmt",
+                "rapidcsv",
+                "spdlog",
+                "toml11",
+                "xbyak"
             ]
         }
     },

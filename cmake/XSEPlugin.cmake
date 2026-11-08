@@ -144,7 +144,20 @@ find_package(magic_enum CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 
 if (BUILD_SKYRIM)
-	find_package(CommonLibSSE REQUIRED)
+	if(DEFINED UPSCALER_COMMONLIB_SOURCE)
+        set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(ENABLE_SKYRIM_SE OFF CACHE BOOL "" FORCE)
+        set(ENABLE_SKYRIM_AE ON CACHE BOOL "" FORCE)
+        set(ENABLE_SKYRIM_VR OFF CACHE BOOL "" FORCE)
+
+        add_subdirectory(
+            "${UPSCALER_COMMONLIB_SOURCE}"
+            "${CMAKE_BINARY_DIR}/commonlib-ng"
+            EXCLUDE_FROM_ALL
+        )
+    else()
+        find_package(CommonLibSSE REQUIRED)
+    endif()
 	target_link_libraries(
 		${PROJECT_NAME} 
 		PUBLIC 

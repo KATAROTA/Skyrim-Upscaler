@@ -1,0 +1,59 @@
+name: Build Skyrim Upscaler
+
+on:
+  push:
+    branches:
+      - support-skyrim-1.7.104
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install vcpkg
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP/vcpkg"
+          & "$env:RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          "VCPKG_ROOT=$env:RUNNER_TEMP/vcpkg" >> $env:GITHUB_ENV
+
+      - name: Configure vcpkg baseline
+        shell: pwsh
+        run: |
+          $baseline = (git -C "$env:VCPKG_ROOT" rev-parse HEAD).Trim()
+          $config = Get-Content vcpkg-configuration.json -Raw | ConvertFrom-Json
+          $config | Add-Member -NotePropertyName "default-registry" -NotePropertyValue @{
+            kind = "builtin"
+            baseline = $baseline
+          } -Force
+          $config | ConvertTo-Json -Depth 20 |
+            Set-Content vcpkg-configuration.json -Encoding utf8
+
+      - name: Download CommonLibSSE-NG
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch ng https://github.com/alandtse/CommonLibSSE-NG.git CommonLibSSE-NG
+          git -C CommonLibSSE-NG submodule update --init --recursive --progress
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake --preset skyrim `
+            "-DUPSCALER_COMMONLIB_SOURCE=$env:GITHUB_WORKSPACE/CommonLibSSE-NG" `
+            -DSKSE_SUPPORT_PATCH_SAFETY=OFF
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          cmake --build build/skyrim --config Release --target SkyrimUpscaler --parallel 2
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: SkyrimUpscaler-1.7.104-test
+          path: build/skyrim/Release/SkyrimUpscaler.dll
+          if-no-files-found: error
