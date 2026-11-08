@@ -23,6 +23,8 @@ static void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
 void Init()
 {
 	SKSE::GetMessagingInterface()->RegisterListener(MessageHandler);
+	SKSE::AllocTrampoline(256);
+
 	DRS::InstallHooks();
 	InstallUpscalerHooks();
 }
@@ -96,6 +98,11 @@ EXTERN_C [[maybe_unused]] __declspec(dllexport) bool __cdecl SKSEPlugin_Load(con
 	logger::info("Loaded plugin");
 
 	SKSE::Init(a_skse);
+
+	if (REL::Module::get().version() != REL::Version{ 1, 7, 104, 0 }) {
+		logger::error("Unsupported Skyrim runtime; expected 1.7.104.0");
+		return false;
+	}
 
 	Init();
 
