@@ -62,7 +62,7 @@ target_precompile_headers(
 		include/PCH.h
 )
 
-find_path(SIMPLEINI_INCLUDE_DIRS "ConvertUTF.c")
+find_path(SIMPLEINI_INCLUDE_DIRS NAMES SimpleIni.h REQUIRED)
 
 target_include_directories(
 	"${PROJECT_NAME}"
