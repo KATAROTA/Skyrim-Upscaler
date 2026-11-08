@@ -91,7 +91,6 @@ if (CMAKE_GENERATOR MATCHES "Visual Studio")
 		"${PROJECT_NAME}"
 		PRIVATE
 			/MP
-			/await
 			/W4
 			/WX-
 			/permissive-
