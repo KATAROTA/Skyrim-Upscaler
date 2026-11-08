@@ -5,7 +5,7 @@ LRESULT WndProcHook::thunk(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	auto& io = ImGui::GetIO();
 	if (uMsg == WM_KILLFOCUS) {
-		io.ClearInputCharacters();
+		// ClearInputKeys also clears input characters.
 		io.ClearInputKeys();
 	}
 	return func(hWnd, uMsg, wParam, lParam);
@@ -70,10 +70,10 @@ void SettingGUI::InitIMGUI(IDXGISwapChain* swapchain, ID3D11Device* device, ID3D
 void SettingGUI::OnRender()
 {
 	if (REL::Module::IsVR()) {
-		ProcessEvent(mToggleHotkey);
+		ProcessEvent(static_cast<ImGuiKey>(mToggleHotkey));
 	}
 	
-	if (ImGui::IsKeyReleased(mToggleHotkey))
+	if (ImGui::IsKeyReleased(static_cast<ImGuiKey>(mToggleHotkey)))
 		toggle();
 
 	auto&  io = ImGui::GetIO();

@@ -2,6 +2,7 @@
 /***************SKSE PLUGIN***************/
 
 #include "Plugin.h"
+#include <SKSE/API.h>
 #include <DRS.h>
 #include <SkyrimUpscaler.h>
 
