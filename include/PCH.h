@@ -1,5 +1,7 @@
 #pragma once
 
+#include <coroutine>
+
 //#undef NDEBUG
 
 #pragma warning(push)
