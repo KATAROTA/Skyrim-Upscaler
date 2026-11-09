@@ -36,6 +36,8 @@ decltype(&ID3D11DeviceContext::RSSetScissorRects) ptrRSSetScissorRects;
 struct Build14RasterCounters
 {
     std::atomic<unsigned int> vpFull{ 0 }, vpInternal{ 0 }, vpOther{ 0 };
+    std::atomic<unsigned int> vpNearInternal{ 0 }, vpReducedAspect{ 0 };
+    std::atomic<unsigned int> vpReducedLastWidth{ 0 }, vpReducedLastHeight{ 0 };
     std::atomic<unsigned int> scFull{ 0 }, scInternal{ 0 }, scOther{ 0 };
     std::atomic<unsigned int> vpLastWidth{ 0 }, vpLastHeight{ 0 };
     std::atomic<unsigned int> scLastWidth{ 0 }, scLastHeight{ 0 };
@@ -62,8 +64,26 @@ void WINAPI hk_ID3D11DeviceContext_RSSetViewports(ID3D11DeviceContext* This, UIN
             gRasterCounters.vpInternal.fetch_add(1, std::memory_order_relaxed);
         else if (Build14DimensionsMatch(vp.Width, vp.Height, u->mDisplaySizeX, u->mDisplaySizeY))
             gRasterCounters.vpFull.fetch_add(1, std::memory_order_relaxed);
-        else
+        else {
             gRasterCounters.vpOther.fetch_add(1, std::memory_order_relaxed);
+            // Account for reductions rounded to GPU-friendly dimensions.
+            const float desiredW = static_cast<float>(u->mRenderSizeX);
+            const float desiredH = static_cast<float>(u->mRenderSizeY);
+            if (std::fabs(vp.Width - desiredW) <= 32.0f &&
+                std::fabs(vp.Height - desiredH) <= 32.0f) {
+                gRasterCounters.vpNearInternal.fetch_add(1, std::memory_order_relaxed);
+            }
+            const float fullW = static_cast<float>(u->mDisplaySizeX);
+            const float fullH = static_cast<float>(u->mDisplaySizeY);
+            if (vp.Width >= fullW * 0.45f && vp.Width < fullW - 16.0f &&
+                vp.Height >= fullH * 0.45f && vp.Height < fullH - 16.0f &&
+                vp.Height > 0.0f &&
+                std::fabs(vp.Width / vp.Height - fullW / fullH) < 0.035f) {
+                gRasterCounters.vpReducedAspect.fetch_add(1, std::memory_order_relaxed);
+                gRasterCounters.vpReducedLastWidth.store(static_cast<unsigned int>(vp.Width), std::memory_order_relaxed);
+                gRasterCounters.vpReducedLastHeight.store(static_cast<unsigned int>(vp.Height), std::memory_order_relaxed);
+            }
+        }
     }
     (This->*ptrRSSetViewports)(NumViewports, pViewports);
 }
@@ -105,10 +125,13 @@ HRESULT WINAPI hk_IDXGISwapChain_Present(IDXGISwapChain* This, UINT SyncInterval
     if (++presentedFrames % 120 == 0) {
         auto* u = SkyrimUpscaler::GetSingleton();
         if (u->mTraceRasterStats && u->mUpscalerReady) {
-            logger::info("Build14 raster: DRS={} desired={}x{} output={}x{} | viewport full={} internal={} other={} last={}x{} | scissor full={} internal={} other={} last={}x{}",
+            logger::info("Build15 raster: DRS={} desired={}x{} output={}x{} | viewport full={} internal={} near32={} reducedAspect={} sampleReduced={}x{} other={} last={}x{} | scissor full={} internal={} other={} last={}x{}",
                 DRS::GetSingleton()->currentScaleFactor,
                 u->mRenderSizeX, u->mRenderSizeY, u->mDisplaySizeX, u->mDisplaySizeY,
-                gRasterCounters.vpFull.exchange(0), gRasterCounters.vpInternal.exchange(0), gRasterCounters.vpOther.exchange(0),
+                gRasterCounters.vpFull.exchange(0), gRasterCounters.vpInternal.exchange(0),
+                gRasterCounters.vpNearInternal.exchange(0), gRasterCounters.vpReducedAspect.exchange(0),
+                gRasterCounters.vpReducedLastWidth.load(), gRasterCounters.vpReducedLastHeight.load(),
+                gRasterCounters.vpOther.exchange(0),
                 gRasterCounters.vpLastWidth.load(), gRasterCounters.vpLastHeight.load(),
                 gRasterCounters.scFull.exchange(0), gRasterCounters.scInternal.exchange(0), gRasterCounters.scOther.exchange(0),
                 gRasterCounters.scLastWidth.load(), gRasterCounters.scLastHeight.load());
@@ -439,7 +462,7 @@ struct UpscalerHooks
 			auto* upscaler = SkyrimUpscaler::GetSingleton();
 			const float width = static_cast<float>(upscaler->mRenderSizeX);
 			const float height = static_cast<float>(upscaler->mRenderSizeY);
-			if (upscaler->IsEnabled() && upscaler->mEnableJitter && upscaler->mUpscaleType != TAA) {
+			if (upscaler->IsEnabled() && upscaler->mEnableJitter && !upscaler->mDisableEvaluation && upscaler->mUpscaleType != TAA) {
 				if (!(width > 0.0f && height > 0.0f && width <= 16384.0f && height <= 16384.0f)) {
 					static bool warnedSize = false;
 					if (!warnedSize) {

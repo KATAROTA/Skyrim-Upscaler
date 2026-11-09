@@ -8,6 +8,7 @@ on:
       - fix-fsr2-jitter-init
       - debug-metalfx-input-region
       - probe-metalfx-drs-raster
+      - probe-metalfx-render-regions-b15
   workflow_dispatch:
 
 jobs:
