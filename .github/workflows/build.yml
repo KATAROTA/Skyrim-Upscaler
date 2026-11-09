@@ -6,6 +6,7 @@ on:
       - support-skyrim-1.7.104
       - audit-1.7.104-runtime-safety
       - fix-fsr2-jitter-init
+      - debug-metalfx-input-region
   workflow_dispatch:
 
 jobs:

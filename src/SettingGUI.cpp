@@ -142,6 +142,12 @@ void SettingGUI::OnRender()
 		auto* upscaler = SkyrimUpscaler::GetSingleton();
 		const auto w = static_cast<float>(upscaler->mRenderSizeX > 0 ? upscaler->mRenderSizeX : 1);
 		const auto h = static_cast<float>(upscaler->mRenderSizeY > 0 ? upscaler->mRenderSizeY : 1);
+		ImGui::BeginDisabled(!upscaler->mUpscalerReady || (upscaler->mUpscaleType != DLSS && upscaler->mUpscaleType != DLAA));
+		if (ImGui::Checkbox("DEBUG: MetalFX full-size input", &upscaler->mForceMetalFXFullInput)) {
+			logger::info("MetalFX diagnostic input override: {}", upscaler->mForceMetalFXFullInput);
+		}
+		ImGui::EndDisabled();
+		ImGui::TextDisabled("Diagnostic only: full input does not save GPU rendering work.");
 		ImGui::BeginDisabled(!upscaler->mUpscalerReady);
 
 		if (ImGui::DragFloat("MotionScale X", &SkyrimUpscaler::GetSingleton()->mMotionScale[0], 0.01f, -w, w) ||

@@ -121,7 +121,32 @@ void SkyrimUpscaler::EvaluateUpscaler(ID3D11Texture2D* source)
 				mContext->CopyResource(mTempColor.mImage, source);
 				int j = (mEnableJitter) ? 1 : 0;
 				if (!mDisableEvaluation) {
-					SimpleEvaluate(0, mTempColor.mImage, mMotionVectors.mImage, mDepthBuffer.mImage, transparentMask, mTargetTex.mImage, mRenderSizeX, mRenderSizeY, mSharpness, 
+					const bool fullInput = mForceMetalFXFullInput && (mUpscaleType == DLSS || mUpscaleType == DLAA);
+					const int inputWidth = fullInput ? mDisplaySizeX : mRenderSizeX;
+					const int inputHeight = fullInput ? mDisplaySizeY : mRenderSizeY;
+					static int lastFullInput = -1;
+					static unsigned int diagCount = 0;
+					if (lastFullInput != static_cast<int>(fullInput)) {
+						lastFullInput = static_cast<int>(fullInput);
+						diagCount = 0;
+					}
+					if (diagCount++ < 5) {
+						D3D11_TEXTURE2D_DESC srcDesc{}, dstDesc{}, mvDesc{}, depthDesc{};
+						mTempColor.mImage->GetDesc(&srcDesc);
+						mTargetTex.mImage->GetDesc(&dstDesc);
+							mMotionVectors.mImage->GetDesc(&mvDesc);
+						mDepthBuffer.mImage->GetDesc(&depthDesc);
+						UINT viewportCount = 1;
+						D3D11_VIEWPORT viewport{};
+						mContext->RSGetViewports(&viewportCount, &viewport);
+						const auto* drs = DRS::GetSingleton();
+						logger::info("MetalFX input test: mode={} fullInput={} inputRegion={}x{} source={}x{} output={}x{} motion={}x{} depth={}x{} DRS current={} target={} reset={} currentViewport={}x{}",
+							mUpscaleType, fullInput, inputWidth, inputHeight, srcDesc.Width, srcDesc.Height,
+							dstDesc.Width, dstDesc.Height, mvDesc.Width, mvDesc.Height, depthDesc.Width, depthDesc.Height,
+							drs->currentScaleFactor, drs->targetScaleFactor, drs->reset,
+							viewportCount == 1 ? viewport.Width : 0.0f, viewportCount == 1 ? viewport.Height : 0.0f);
+					}
+					SimpleEvaluate(0, mTempColor.mImage, mMotionVectors.mImage, mDepthBuffer.mImage, transparentMask, mTargetTex.mImage, inputWidth, inputHeight, mSharpness,
 						mJitterOffsets[0] * j, mJitterOffsets[1] * j, mMotionScale[0], mMotionScale[1], false, g_fNear / 100, g_fFar / 100, GetVerticalFOVRad());
 					mContext->CopyResource(mMotionVectors.mImage, mMotionVectorsEmpty.mImage);
 				}
@@ -280,12 +305,12 @@ void SkyrimUpscaler::InitUpscaler()
 		// These two run on DX12, need to make sure the job of last frame is done before reinitializing
 		if (upscaleType == FSR2 || upscaleType == XESS)
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-		logger::info("FSR2 SimpleInit starting: mode={}, quality={}, display={}x{}, format={}",
+		logger::info("Upscaler SimpleInit starting: mode={}, quality={}, display={}x{}, format={}",
 			upscaleType, mQualityLevel, mDisplaySizeX, mDisplaySizeY, static_cast<unsigned int>(desc.Format));
 		mOutColor.mImage = (ID3D11Texture2D*)SimpleInit(0, upscaleType, mQualityLevel, mDisplaySizeX, mDisplaySizeY, false, false, false, false, mSharpening, true, desc.Format);
-		logger::info("FSR2 SimpleInit returned output texture address: 0x{:X}", reinterpret_cast<std::uintptr_t>(mOutColor.mImage));
+		logger::info("Upscaler SimpleInit returned output texture address: 0x{:X}", reinterpret_cast<std::uintptr_t>(mOutColor.mImage));
 		if (mOutColor.mImage == nullptr) {
-			logger::error("FSR2 output texture not available; disabling upscaler before jitter/rendering");
+			logger::error("Upscaler output texture not available; disabling upscaler before jitter/rendering");
 			SetEnabled(false);
 			return;
 		}
@@ -305,9 +330,9 @@ void SkyrimUpscaler::InitUpscaler()
 			mRenderSizeY = GetRenderHeight(0);
 			mRenderScale = float(mRenderSizeX) / mDisplaySizeX;
 		}
-		logger::info("FSR2 render size {}x{} versus output size {}x{}", mRenderSizeX, mRenderSizeY, mDisplaySizeX, mDisplaySizeY);
+		logger::info("Upscaler render size {}x{} versus output size {}x{}", mRenderSizeX, mRenderSizeY, mDisplaySizeX, mDisplaySizeY);
 		if (mRenderSizeX <= 0 || mRenderSizeY <= 0 || mRenderSizeX > 16384 || mRenderSizeY > 16384) {
-			logger::error("FSR2 invalid render dimensions, stopping before Jitter / DRS / MotionScale");
+			logger::error("Upscaler invalid render dimensions, stopping before Jitter / DRS / MotionScale");
 			SetEnabled(false);
 			return;
 		}
@@ -327,7 +352,7 @@ void SkyrimUpscaler::InitUpscaler()
 				mMipLodBias = 0;
 		}
 		mUpscalerReady = true;
-		logger::info("FSR2 initialization READY; jitter can now use validated render dimensions");
+		logger::info("Upscaler initialization READY; jitter can now use validated render dimensions");
 		UnkOuterStruct::GetSingleton()->SetTAA(false);
 	} else {
 		DRS::GetSingleton()->targetScaleFactor = 1.0f;

@@ -56,8 +56,22 @@ void DRS::SetDRS(BSGraphics::State* a_state)
 		SetDRSVR(currentScaleFactor);
 	}
 	auto& runtimeData = a_state->GetRuntimeData();
+	const float oldWidth = runtimeData.fDynamicResolutionCurrentWidthScale;
+	const float oldHeight = runtimeData.fDynamicResolutionCurrentHeightScale;
 	runtimeData.fDynamicResolutionCurrentHeightScale = currentScaleFactor;
 	runtimeData.fDynamicResolutionCurrentWidthScale = currentScaleFactor;
+	static int diagnosticFrames = 0;
+	static float lastDiagnosticScale = -1.0f;
+	if (lastDiagnosticScale != currentScaleFactor) {
+		lastDiagnosticScale = currentScaleFactor;
+		diagnosticFrames = 0;
+	}
+	if (diagnosticFrames++ < 12) {
+		logger::info("DRS hook: requested={} oldWidth={} oldHeight={} appliedWidth={} appliedHeight={} stateOffset=0x{:X}",
+			currentScaleFactor, oldWidth, oldHeight,
+			runtimeData.fDynamicResolutionCurrentWidthScale, runtimeData.fDynamicResolutionCurrentHeightScale,
+			static_cast<unsigned int>(reinterpret_cast<std::uintptr_t>(&runtimeData) - reinterpret_cast<std::uintptr_t>(a_state)));
+	}
 	lastScaleFactor = currentScaleFactor;
 }
 

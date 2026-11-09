@@ -121,6 +121,7 @@ public:
 	int   mQualityLevel{ 0 };
 	float mMipLodBias{ 0 };
 
+	bool mForceMetalFXFullInput{ false };  // Temporary diagnostic: treat entire source texture as input content
 	bool mDisableEvaluation{ false };
 	bool mUseOptimalMipLodBias{ true };
 	bool mEnableTransparentMask{ false };
