@@ -122,6 +122,7 @@ public:
 	float mMipLodBias{ 0 };
 
 	bool mForceMetalFXFullInput{ false };  // Temporary diagnostic: treat entire source texture as input content
+	bool mTraceRasterStats{ true };  // Build 14: log actual viewport / scissor regions; no rendering override
 	bool mDisableEvaluation{ false };
 	bool mUseOptimalMipLodBias{ true };
 	bool mEnableTransparentMask{ false };

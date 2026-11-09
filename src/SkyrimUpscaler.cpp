@@ -145,6 +145,17 @@ void SkyrimUpscaler::EvaluateUpscaler(ID3D11Texture2D* source)
 							dstDesc.Width, dstDesc.Height, mvDesc.Width, mvDesc.Height, depthDesc.Width, depthDesc.Height,
 							drs->currentScaleFactor, drs->targetScaleFactor, drs->reset,
 							viewportCount == 1 ? viewport.Width : 0.0f, viewportCount == 1 ? viewport.Height : 0.0f);
+                        // These renderer buffers are advisory only: do not hand an HDR world buffer
+                        // to MetalFX as an RGBA8 input without checking format, contents and timing.
+                        D3D11_TEXTURE2D_DESC opaqueDesc{};
+                        const bool hasOpaque = (mOpaqueColor.mImage != nullptr);
+                        if (hasOpaque)
+                            mOpaqueColor.mImage->GetDesc(&opaqueDesc);
+                        logger::info("Build14 buffers: backbuffer={}x{} fmt={} source={}x{} fmt={} opaqueFound={} opaque={}x{} fmt={} bind=0x{:X} depthFmt={} motionFmt={}",
+                            dstDesc.Width, dstDesc.Height, static_cast<unsigned int>(dstDesc.Format),
+                            srcDesc.Width, srcDesc.Height, static_cast<unsigned int>(srcDesc.Format),
+                            hasOpaque, opaqueDesc.Width, opaqueDesc.Height, static_cast<unsigned int>(opaqueDesc.Format), opaqueDesc.BindFlags,
+                            static_cast<unsigned int>(depthDesc.Format), static_cast<unsigned int>(mvDesc.Format));
 					}
 					SimpleEvaluate(0, mTempColor.mImage, mMotionVectors.mImage, mDepthBuffer.mImage, transparentMask, mTargetTex.mImage, inputWidth, inputHeight, mSharpness,
 						mJitterOffsets[0] * j, mJitterOffsets[1] * j, mMotionScale[0], mMotionScale[1], false, g_fNear / 100, g_fFar / 100, GetVerticalFOVRad());

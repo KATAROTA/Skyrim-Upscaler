@@ -7,6 +7,7 @@ on:
       - audit-1.7.104-runtime-safety
       - fix-fsr2-jitter-init
       - debug-metalfx-input-region
+      - probe-metalfx-drs-raster
   workflow_dispatch:
 
 jobs:

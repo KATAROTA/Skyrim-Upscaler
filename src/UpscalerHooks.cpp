@@ -29,6 +29,66 @@ decltype(&ID3D11DeviceContext::GSSetSamplers) ptrGSSetSamplers;
 decltype(&ID3D11DeviceContext::HSSetSamplers) ptrHSSetSamplers;
 decltype(&ID3D11DeviceContext::DSSetSamplers) ptrDSSetSamplers;
 decltype(&ID3D11DeviceContext::CSSetSamplers) ptrCSSetSamplers;
+decltype(&ID3D11DeviceContext::RSSetViewports) ptrRSSetViewports;
+decltype(&ID3D11DeviceContext::RSSetScissorRects) ptrRSSetScissorRects;
+
+// Instrumentation only: original D3D11 calls are always forwarded unchanged.
+struct Build14RasterCounters
+{
+    std::atomic<unsigned int> vpFull{ 0 }, vpInternal{ 0 }, vpOther{ 0 };
+    std::atomic<unsigned int> scFull{ 0 }, scInternal{ 0 }, scOther{ 0 };
+    std::atomic<unsigned int> vpLastWidth{ 0 }, vpLastHeight{ 0 };
+    std::atomic<unsigned int> scLastWidth{ 0 }, scLastHeight{ 0 };
+};
+static Build14RasterCounters gRasterCounters;
+
+static bool Build14DimensionsMatch(float width, float height, int wantedWidth, int wantedHeight)
+{
+    return wantedWidth > 0 && wantedHeight > 0 &&
+        std::fabs(width - static_cast<float>(wantedWidth)) <= 2.0f &&
+        std::fabs(height - static_cast<float>(wantedHeight)) <= 2.0f;
+}
+
+void WINAPI hk_ID3D11DeviceContext_RSSetViewports(ID3D11DeviceContext* This, UINT NumViewports, const D3D11_VIEWPORT* pViewports)
+{
+    const auto* u = SkyrimUpscaler::GetSingleton();
+    if (u->mTraceRasterStats && NumViewports > 0 && pViewports &&
+        u->mDisplaySizeX > 0 && u->mRenderSizeX > 0) {
+        const auto& vp = pViewports[0];
+        gRasterCounters.vpLastWidth.store(static_cast<unsigned int>(vp.Width), std::memory_order_relaxed);
+        gRasterCounters.vpLastHeight.store(static_cast<unsigned int>(vp.Height), std::memory_order_relaxed);
+        if (Build14DimensionsMatch(vp.Width, vp.Height, u->mRenderSizeX, u->mRenderSizeY) &&
+            !Build14DimensionsMatch(vp.Width, vp.Height, u->mDisplaySizeX, u->mDisplaySizeY))
+            gRasterCounters.vpInternal.fetch_add(1, std::memory_order_relaxed);
+        else if (Build14DimensionsMatch(vp.Width, vp.Height, u->mDisplaySizeX, u->mDisplaySizeY))
+            gRasterCounters.vpFull.fetch_add(1, std::memory_order_relaxed);
+        else
+            gRasterCounters.vpOther.fetch_add(1, std::memory_order_relaxed);
+    }
+    (This->*ptrRSSetViewports)(NumViewports, pViewports);
+}
+
+void WINAPI hk_ID3D11DeviceContext_RSSetScissorRects(ID3D11DeviceContext* This, UINT NumRects, const D3D11_RECT* pRects)
+{
+    const auto* u = SkyrimUpscaler::GetSingleton();
+    if (u->mTraceRasterStats && NumRects > 0 && pRects &&
+        u->mDisplaySizeX > 0 && u->mRenderSizeX > 0) {
+        const auto& rect = pRects[0];
+        const float width = static_cast<float>(rect.right - rect.left);
+        const float height = static_cast<float>(rect.bottom - rect.top);
+        gRasterCounters.scLastWidth.store(width > 0 ? static_cast<unsigned int>(width) : 0u, std::memory_order_relaxed);
+        gRasterCounters.scLastHeight.store(height > 0 ? static_cast<unsigned int>(height) : 0u, std::memory_order_relaxed);
+        if (Build14DimensionsMatch(width, height, u->mRenderSizeX, u->mRenderSizeY) &&
+            !Build14DimensionsMatch(width, height, u->mDisplaySizeX, u->mDisplaySizeY))
+            gRasterCounters.scInternal.fetch_add(1, std::memory_order_relaxed);
+        else if (Build14DimensionsMatch(width, height, u->mDisplaySizeX, u->mDisplaySizeY))
+            gRasterCounters.scFull.fetch_add(1, std::memory_order_relaxed);
+        else
+            gRasterCounters.scOther.fetch_add(1, std::memory_order_relaxed);
+    }
+    (This->*ptrRSSetScissorRects)(NumRects, pRects);
+}
+
 
 static void MyLog(char* message, int size)
 {
@@ -41,6 +101,19 @@ HRESULT WINAPI hk_IDXGISwapChain_Present(IDXGISwapChain* This, UINT SyncInterval
 	SettingGUI::GetSingleton()->OnRender();
 	auto hr = (This->*ptrPresent)(SyncInterval, Flags);
 	DRS::GetSingleton()->Update();
+    static unsigned int presentedFrames = 0;
+    if (++presentedFrames % 120 == 0) {
+        auto* u = SkyrimUpscaler::GetSingleton();
+        if (u->mTraceRasterStats && u->mUpscalerReady) {
+            logger::info("Build14 raster: DRS={} desired={}x{} output={}x{} | viewport full={} internal={} other={} last={}x{} | scissor full={} internal={} other={} last={}x{}",
+                DRS::GetSingleton()->currentScaleFactor,
+                u->mRenderSizeX, u->mRenderSizeY, u->mDisplaySizeX, u->mDisplaySizeY,
+                gRasterCounters.vpFull.exchange(0), gRasterCounters.vpInternal.exchange(0), gRasterCounters.vpOther.exchange(0),
+                gRasterCounters.vpLastWidth.load(), gRasterCounters.vpLastHeight.load(),
+                gRasterCounters.scFull.exchange(0), gRasterCounters.scInternal.exchange(0), gRasterCounters.scOther.exchange(0),
+                gRasterCounters.scLastWidth.load(), gRasterCounters.scLastHeight.load());
+        }
+    }
 	return hr;
 }
 
@@ -276,6 +349,9 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
 	*(uintptr_t*)&ptrHSSetSamplers = Detours::X64::DetourClassVTable(*(uintptr_t*)deviceContext, &hk_ID3D11DeviceContext_HSSetSamplers, 61);
 	*(uintptr_t*)&ptrDSSetSamplers = Detours::X64::DetourClassVTable(*(uintptr_t*)deviceContext, &hk_ID3D11DeviceContext_DSSetSamplers, 65);
 	*(uintptr_t*)&ptrCSSetSamplers = Detours::X64::DetourClassVTable(*(uintptr_t*)deviceContext, &hk_ID3D11DeviceContext_CSSetSamplers, 70);
+    // ID3D11DeviceContext vtable slots 44/45: observation only, no viewport mutations.
+    *(uintptr_t*)&ptrRSSetViewports = Detours::X64::DetourClassVTable(*(uintptr_t*)deviceContext, &hk_ID3D11DeviceContext_RSSetViewports, 44);
+    *(uintptr_t*)&ptrRSSetScissorRects = Detours::X64::DetourClassVTable(*(uintptr_t*)deviceContext, &hk_ID3D11DeviceContext_RSSetScissorRects, 45);
 
 	return hr;
 }

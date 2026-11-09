@@ -148,6 +148,8 @@ void SettingGUI::OnRender()
 		}
 		ImGui::EndDisabled();
 		ImGui::TextDisabled("Diagnostic only: full input does not save GPU rendering work.");
+		ImGui::Checkbox("DEBUG: record DRS viewport/scissor", &upscaler->mTraceRasterStats);
+		ImGui::TextDisabled("Read-only raster probe; logs every 120 presented frames.");
 		ImGui::BeginDisabled(!upscaler->mUpscalerReady);
 
 		if (ImGui::DragFloat("MotionScale X", &SkyrimUpscaler::GetSingleton()->mMotionScale[0], 0.01f, -w, w) ||
