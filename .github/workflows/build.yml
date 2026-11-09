@@ -5,6 +5,7 @@ on:
     branches:
       - support-skyrim-1.7.104
       - audit-1.7.104-runtime-safety
+      - fix-fsr2-jitter-init
   workflow_dispatch:
 
 jobs:

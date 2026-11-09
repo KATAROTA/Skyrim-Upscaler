@@ -103,10 +103,13 @@ void SettingGUI::OnRender()
 		ImGui::Checkbox("Disable Evaluation", &SkyrimUpscaler::GetSingleton()->mDisableEvaluation);
 		ImGui::Checkbox("Jitter", &SkyrimUpscaler::GetSingleton()->mEnableJitter);
 		//ImGui::Checkbox("Enable Transparent Mask", &SkyrimUpscaler::GetSingleton()->mEnableTransparentMask);
-		if (ImGui::Checkbox("Sharpness", &SkyrimUpscaler::GetSingleton()->mSharpening)) {
-			SkyrimUpscaler::GetSingleton()->InitUpscaler();
-		}
+		// Reinitializing FSR2 while rendering crashed Wine during the previous test.
+		// These settings are intentionally frozen until a safe reset path exists.
+		ImGui::BeginDisabled();
+		ImGui::Checkbox("Sharpness (restart required)", &SkyrimUpscaler::GetSingleton()->mSharpening);
 		ImGui::DragFloat("Sharpness Amount", &SkyrimUpscaler::GetSingleton()->mSharpness, 0.01f, 0.0f, 5.0f);
+		ImGui::EndDisabled();
+		ImGui::TextDisabled("Edit the INI and restart Skyrim to change sharpening.");
 
 		if (ImGui::Checkbox("Use Optimal Mip Lod Bias", &SkyrimUpscaler::GetSingleton()->mUseOptimalMipLodBias)) {
 			if (SkyrimUpscaler::GetSingleton()->mUseOptimalMipLodBias) {
@@ -127,26 +130,19 @@ void SettingGUI::OnRender()
 		imgui_combo_names.push_back("DLAA");
 		imgui_combo_names.push_back("TAA");
 
-		if (ImGui::Combo("Upscale Type", (int*)&SkyrimUpscaler::GetSingleton()->mUpscaleType, imgui_combo_names.data(), imgui_combo_names.size())) {
-			if (SkyrimUpscaler::GetSingleton()->mUpscaleType < 0 || SkyrimUpscaler::GetSingleton()->mUpscaleType >= imgui_combo_names.size()) {
-				SkyrimUpscaler::GetSingleton()->mUpscaleType = 0;
-			}
-
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-			SkyrimUpscaler::GetSingleton()->InitUpscaler();
-		}
-		const auto qualities = (SkyrimUpscaler::GetSingleton()->mUpscaleType == XESS) 
-			? "Performance\0Balanced\0Quality\0UltraQuality\0" 
+		ImGui::BeginDisabled();
+		ImGui::Combo("Upscale Type", (int*)&SkyrimUpscaler::GetSingleton()->mUpscaleType, imgui_combo_names.data(), imgui_combo_names.size());
+		const auto qualities = (SkyrimUpscaler::GetSingleton()->mUpscaleType == XESS)
+			? "Performance\0Balanced\0Quality\0UltraQuality\0"
 			: "Performance\0Balanced\0Quality\0UltraPerformance\0";
+		ImGui::Combo("Quality Level", (int*)&SkyrimUpscaler::GetSingleton()->mQualityLevel, qualities);
+		ImGui::EndDisabled();
+		ImGui::TextDisabled("Upscale mode / quality: change INI, restart Skyrim.");
 
-		ImGui::BeginDisabled(SkyrimUpscaler::GetSingleton()->mUpscaleType == TAA);
-		if (ImGui::Combo("Quality Level", (int*)&SkyrimUpscaler::GetSingleton()->mQualityLevel, qualities)) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-			SkyrimUpscaler::GetSingleton()->InitUpscaler();
-		}
-
-		const auto w = (float)GetRenderWidth(0);
-		const auto h = (float)GetRenderHeight(0);
+		auto* upscaler = SkyrimUpscaler::GetSingleton();
+		const auto w = static_cast<float>(upscaler->mRenderSizeX > 0 ? upscaler->mRenderSizeX : 1);
+		const auto h = static_cast<float>(upscaler->mRenderSizeY > 0 ? upscaler->mRenderSizeY : 1);
+		ImGui::BeginDisabled(!upscaler->mUpscalerReady);
 
 		if (ImGui::DragFloat("MotionScale X", &SkyrimUpscaler::GetSingleton()->mMotionScale[0], 0.01f, -w, w) ||
 			ImGui::DragFloat("MotionScale Y", &SkyrimUpscaler::GetSingleton()->mMotionScale[1], 0.01f, -h, h)) {

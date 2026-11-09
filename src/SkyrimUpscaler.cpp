@@ -2,6 +2,7 @@
 #include <PCH.h>
 #include <DRS.h>
 #include <ReShadePlugin.h>
+#include <cmath>
 
 
 #define GetSettingInt(a_section, a_setting, a_default) a_setting = (int)ini.GetLongValue(a_section, #a_setting, a_default);
@@ -131,16 +132,31 @@ void SkyrimUpscaler::EvaluateUpscaler(ID3D11Texture2D* source)
 
 bool SkyrimUpscaler::IsEnabled()
 {
-	return mEnableUpscaler && !DRS::GetSingleton()->reset;
+	return mEnableUpscaler && mUpscalerReady && !DRS::GetSingleton()->reset;
 }
 
 
 void SkyrimUpscaler::GetJitters(float* out_x, float* out_y)
 {
+	*out_x = 0.0f;
+	*out_y = 0.0f;
+	if (!mUpscalerReady || mRenderSizeX <= 0 || mRenderSizeY <= 0)
+		return;
 	const auto phase = GetJitterPhaseCount(0);
-
+	if (phase <= 0) {
+		static bool warned = false;
+		if (!warned) {
+			logger::error("GetJitterPhaseCount returned {}, withholding jitter", phase);
+			warned = true;
+		}
+		return;
+	}
 	mJitterIndex++;
-	GetJitterOffset(out_x, out_y, mJitterIndex, phase);
+	GetJitterOffset(out_x, out_y, static_cast<int>(mJitterIndex), phase);
+	if (!std::isfinite(*out_x) || !std::isfinite(*out_y)) {
+		logger::error("GetJitterOffset returned nonfinite offsets");
+		*out_x = *out_y = 0.0f;
+	}
 }
 
 void SkyrimUpscaler::SetJitterOffsets(float x, float y)
@@ -241,6 +257,9 @@ void SkyrimUpscaler::PreInit()
 
 void SkyrimUpscaler::InitUpscaler()
 {
+	mUpscalerReady = false;
+	mRenderSizeX = 0;
+	mRenderSizeY = 0;
 	D3D11_TEXTURE2D_DESC desc;
 	ID3D11Texture2D*     back_buffer;
 	if (mSwapChain == nullptr || FAILED(mSwapChain->GetBuffer(0, IID_PPV_ARGS(&back_buffer))) ||
@@ -261,8 +280,12 @@ void SkyrimUpscaler::InitUpscaler()
 		// These two run on DX12, need to make sure the job of last frame is done before reinitializing
 		if (upscaleType == FSR2 || upscaleType == XESS)
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		logger::info("FSR2 SimpleInit starting: mode={}, quality={}, display={}x{}, format={}",
+			upscaleType, mQualityLevel, mDisplaySizeX, mDisplaySizeY, static_cast<unsigned int>(desc.Format));
 		mOutColor.mImage = (ID3D11Texture2D*)SimpleInit(0, upscaleType, mQualityLevel, mDisplaySizeX, mDisplaySizeY, false, false, false, false, mSharpening, true, desc.Format);
+		logger::info("FSR2 SimpleInit returned output texture address: 0x{:X}", reinterpret_cast<std::uintptr_t>(mOutColor.mImage));
 		if (mOutColor.mImage == nullptr) {
+			logger::error("FSR2 output texture not available; disabling upscaler before jitter/rendering");
 			SetEnabled(false);
 			return;
 		}
@@ -282,6 +305,12 @@ void SkyrimUpscaler::InitUpscaler()
 			mRenderSizeY = GetRenderHeight(0);
 			mRenderScale = float(mRenderSizeX) / mDisplaySizeX;
 		}
+		logger::info("FSR2 render size {}x{} versus output size {}x{}", mRenderSizeX, mRenderSizeY, mDisplaySizeX, mDisplaySizeY);
+		if (mRenderSizeX <= 0 || mRenderSizeY <= 0 || mRenderSizeX > 16384 || mRenderSizeY > 16384) {
+			logger::error("FSR2 invalid render dimensions, stopping before Jitter / DRS / MotionScale");
+			SetEnabled(false);
+			return;
+		}
 		mMotionScale[0] = REL::Module::IsVR() ? mRenderSizeX/2 : mRenderSizeX;
 		mMotionScale[1] = mRenderSizeY;
 		SetMotionScaleX(0, mMotionScale[0]);
@@ -297,6 +326,8 @@ void SkyrimUpscaler::InitUpscaler()
 			if (mUseOptimalMipLodBias)
 				mMipLodBias = 0;
 		}
+		mUpscalerReady = true;
+		logger::info("FSR2 initialization READY; jitter can now use validated render dimensions");
 		UnkOuterStruct::GetSingleton()->SetTAA(false);
 	} else {
 		DRS::GetSingleton()->targetScaleFactor = 1.0f;

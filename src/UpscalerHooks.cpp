@@ -8,6 +8,8 @@
 
 #include <Detours.h>
 #include "DRS.h"
+#include <atomic>
+#include <cmath>
 
 static float                                                        mipLodBias = 0;
 static std::unordered_set<ID3D11SamplerState*>                      passThroughSamplers;
@@ -45,6 +47,21 @@ HRESULT WINAPI hk_IDXGISwapChain_Present(IDXGISwapChain* This, UINT SyncInterval
 HRESULT WINAPI hk_ID3D11Device_CreateTexture2D(ID3D11Device* This, const D3D11_TEXTURE2D_DESC* pDesc, const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D)
 {
 	auto hr = (This->*ptrCreateTexture2D)(pDesc, pInitialData, ppTexture2D);
+	if (FAILED(hr)) {
+		// Log only the first few failures to avoid flooding the rendering thread.
+		static std::atomic<unsigned int> failureCount{ 0 };
+		if (failureCount.fetch_add(1, std::memory_order_relaxed) < 12) {
+			if (pDesc) {
+				logger::error("CreateTexture2D failed: HRESULT=0x{:08X}, {}x{}, Format={}, Usage={}, Bind=0x{:X}, Misc=0x{:X}, Mips={}, Array={}, Samples={}",
+					static_cast<unsigned int>(hr), pDesc->Width, pDesc->Height,
+					static_cast<unsigned int>(pDesc->Format), static_cast<unsigned int>(pDesc->Usage),
+					pDesc->BindFlags, pDesc->MiscFlags, pDesc->MipLevels,
+					pDesc->ArraySize, pDesc->SampleDesc.Count);
+			} else {
+				logger::error("CreateTexture2D failed: HRESULT=0x{:08X}, descriptor=null", static_cast<unsigned int>(hr));
+			}
+		}
+	}
 	if (FAILED(hr) || pDesc == nullptr || ppTexture2D == nullptr || *ppTexture2D == nullptr)
 		return hr;
 	static bool locking = false;
@@ -343,22 +360,51 @@ struct UpscalerHooks
 		static void thunk(BSGraphics::State* a_state)
 		{
 			func(a_state);
-			if (SkyrimUpscaler::GetSingleton()->IsEnabled() && 
-				SkyrimUpscaler::GetSingleton()->mEnableJitter) {
-				if (SkyrimUpscaler::GetSingleton()->mUpscaleType != TAA) {
-					float x = 0.0f;
-					float y = 0.0f;
-					SkyrimUpscaler::GetSingleton()->GetJitters(&x, &y);
-					float w = SkyrimUpscaler::GetSingleton()->mRenderSizeX;
-					float h = SkyrimUpscaler::GetSingleton()->mRenderSizeY;
-					a_state->jitter[0] = -2 * x / w;
-					a_state->jitter[1] = 2 * y / h;
-					SkyrimUpscaler::GetSingleton()->SetJitterOffsets(-x, -y);
+			auto* upscaler = SkyrimUpscaler::GetSingleton();
+			const float width = static_cast<float>(upscaler->mRenderSizeX);
+			const float height = static_cast<float>(upscaler->mRenderSizeY);
+			if (upscaler->IsEnabled() && upscaler->mEnableJitter && upscaler->mUpscaleType != TAA) {
+				if (!(width > 0.0f && height > 0.0f && width <= 16384.0f && height <= 16384.0f)) {
+					static bool warnedSize = false;
+					if (!warnedSize) {
+						logger::error("Jitter cancelled: invalid render size {}x{}", upscaler->mRenderSizeX, upscaler->mRenderSizeY);
+						warnedSize = true;
+					}
+					a_state->jitter[0] = 0.0f;
+					a_state->jitter[1] = 0.0f;
+					upscaler->SetJitterOffsets(0.0f, 0.0f);
+					return;
 				}
+				float x = 0.0f;
+				float y = 0.0f;
+				upscaler->GetJitters(&x, &y);
+				const float jitterX = -2.0f * x / width;
+				const float jitterY = 2.0f * y / height;
+				if (!std::isfinite(x) || !std::isfinite(y) ||
+					!std::isfinite(jitterX) || !std::isfinite(jitterY)) {
+					static bool warnedFinite = false;
+					if (!warnedFinite) {
+						logger::error("Jitter cancelled: nonfinite offsets x={} y={} render={}x{}", x, y, width, height);
+						warnedFinite = true;
+					}
+					a_state->jitter[0] = 0.0f;
+					a_state->jitter[1] = 0.0f;
+					upscaler->SetJitterOffsets(0.0f, 0.0f);
+					return;
+				}
+				static int diagnosticFrames = 0;
+				if (diagnosticFrames++ < 8) {
+					const auto offset = reinterpret_cast<std::uintptr_t>(&a_state->jitter[0]) - reinterpret_cast<std::uintptr_t>(a_state);
+					logger::info("Jitter frame {}: size={}x{}, raw=({}, {}), normalized=({}, {}), assumedStateOffset=0x{:X}",
+						 diagnosticFrames, width, height, x, y, jitterX, jitterY, offset);
+				}
+				a_state->jitter[0] = jitterX;
+				a_state->jitter[1] = jitterY;
+				upscaler->SetJitterOffsets(-x, -y);
 			} else {
-				a_state->jitter[0] = 0;
-				a_state->jitter[1] = 0;
-				SkyrimUpscaler::GetSingleton()->SetJitterOffsets(0, 0);
+				a_state->jitter[0] = 0.0f;
+				a_state->jitter[1] = 0.0f;
+				upscaler->SetJitterOffsets(0.0f, 0.0f);
 			}
 		}
 		static inline REL::Relocation<decltype(thunk)> func;

@@ -105,6 +105,7 @@ class SkyrimUpscaler
 public:
 	//Reserve the second value for VR
 	bool  mEnableUpscaler = false;
+	bool  mUpscalerReady{ false };
 	float mJitterIndex{0};
 	float mJitterOffsets[2];
 	float mMotionScale[2]{ 0, 0 };
