@@ -164,6 +164,15 @@ void SettingGUI::OnRender()
         }
         ImGui::EndDisabled();
         ImGui::TextDisabled("Experimental colour path; may look different. OFF = Build17 rendering.");
+        ImGui::BeginDisabled(!upscaler->mUpscalerReady || upscaler->mUpscaleType != DLSS ||
+            !upscaler->mTryEngineDRSRatios || !upscaler->mBuild19PostProcessHookInstalled);
+        if (ImGui::Checkbox("Build19: MetalFX BEFORE Skyrim ImageSpace (experimental)", &upscaler->mUseBuild19PrePost)) {
+            if (upscaler->mUseBuild19PrePost)
+                upscaler->mUseBuild18EarlyMain = false;
+            logger::info("Build19 prepost experiment: {}", upscaler->mUseBuild19PrePost);
+        }
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("HDR round-trip is approximate. OFF keeps the Build17 path; test colours, zoom, FPS.");
 		ImGui::Checkbox("DEBUG: record DRS viewport/scissor", &upscaler->mTraceRasterStats);
 		ImGui::TextDisabled("Read-only raster probe; logs every 120 presented frames.");
 		ImGui::BeginDisabled(!upscaler->mUpscalerReady);

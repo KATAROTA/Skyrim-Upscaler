@@ -317,6 +317,145 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
 };
 static Build18EarlyMain gBuild18EarlyMain;
+
+// Build19: full-size output of the early NGX evaluation. Never write into the swapchain.
+// The colour is converted back to HDR kMAIN before Bethesda's image-space stage.
+struct Build19PrePostResolve
+{
+    ID3D11Texture2D* output = nullptr;
+    ID3D11ShaderResourceView* outputSRV = nullptr;
+    ID3D11ComputeShader* decoder = nullptr;
+    bool attempted = false;
+    bool ready = false;
+
+    bool Ensure(ID3D11Device* dev, ID3D11Texture2D* backBuffer)
+    {
+        if (ready) return true;
+        if (attempted || !dev || !backBuffer) return false;
+        attempted = true;
+
+        D3D11_TEXTURE2D_DESC d{};
+        backBuffer->GetDesc(&d);
+        if (!d.Width || !d.Height || d.Format != DXGI_FORMAT_R8G8B8A8_UNORM) {
+            logger::warn("Build19 prepost: output texture requires RGBA8 backbuffer; format={}",
+                static_cast<unsigned int>(d.Format));
+            return false;
+        }
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.CPUAccessFlags = 0;
+        d.MiscFlags = 0;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        HRESULT hr = dev->CreateTexture2D(&d, nullptr, &output);
+        if (FAILED(hr) || !output) {
+            logger::error("Build19 prepost: intermediate output allocation failed HRESULT=0x{:08X}",
+                static_cast<unsigned int>(hr));
+            return false;
+        }
+        hr = dev->CreateShaderResourceView(output, nullptr, &outputSRV);
+        if (FAILED(hr) || !outputSRV) {
+            logger::error("Build19 prepost: output SRV failed HRESULT=0x{:08X}",
+                static_cast<unsigned int>(hr));
+            return false;
+        }
+        HMODULE compilerDll = LoadLibraryA("d3dcompiler_47.dll");
+        if (!compilerDll) {
+            logger::error("Build19 prepost: d3dcompiler_47.dll unavailable");
+            return false;
+        }
+        using CompileFn = decltype(&D3DCompile);
+        auto compile = reinterpret_cast<CompileFn>(GetProcAddress(compilerDll, "D3DCompile"));
+        if (!compile) {
+            logger::error("Build19 prepost: D3DCompile unavailable");
+            return false;
+        }
+        static constexpr char source[] = R"HLSL(
+Texture2D<float4> UpscaledSDR : register(t0);
+RWTexture2D<float4> DestinationHDR : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID)
+{
+    uint w, h;
+    DestinationHDR.GetDimensions(w, h);
+    if (tid.x >= w || tid.y >= h) return;
+    // Inverse of Build18EarlyMain's Reinhard + 2.2 gamma encoding.
+    // This is a reversible approximation, not Skyrim's actual tone mapping.
+    float3 encoded = saturate(UpscaledSDR.Load(int3(tid.xy, 0)).rgb);
+    float3 reinhard = pow(encoded, 2.2f);
+    float3 hdr = reinhard / max(1.0f - reinhard, 0.00390625f);
+    DestinationHDR[tid.xy] = float4(min(hdr, 64.0f), 1.0f);
+}
+)HLSL";
+        ID3DBlob* bytecode = nullptr;
+        ID3DBlob* diagnostics = nullptr;
+        hr = compile(source, std::strlen(source), "Build19PrePostResolve", nullptr, nullptr,
+            "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &bytecode, &diagnostics);
+        if (FAILED(hr) || !bytecode) {
+            logger::error("Build19 prepost decoder HLSL compile failed: HRESULT=0x{:08X}: {}",
+                static_cast<unsigned int>(hr), diagnostics ?
+                std::string(static_cast<const char*>(diagnostics->GetBufferPointer()), diagnostics->GetBufferSize()) :
+                std::string("no compiler details"));
+            if (diagnostics) diagnostics->Release();
+            if (bytecode) bytecode->Release();
+            return false;
+        }
+        if (diagnostics) diagnostics->Release();
+        hr = dev->CreateComputeShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(), nullptr, &decoder);
+        bytecode->Release();
+        if (FAILED(hr) || !decoder) {
+            logger::error("Build19 prepost: decoder shader creation failed HRESULT=0x{:08X}",
+                static_cast<unsigned int>(hr));
+            return false;
+        }
+        ready = true;
+        logger::info("Build19 prepost GPU path READY: NGX RGBA8 output -> HDR kMAIN, Bethesda ImageSpace remains enabled");
+        return true;
+    }
+
+    bool DecodeToMain(ID3D11DeviceContext* ctx, ID3D11Texture2D* mainTexture,
+        ID3D11UnorderedAccessView* mainUAV)
+    {
+        if (!ctx || !ready || !mainTexture || !mainUAV) return false;
+        D3D11_TEXTURE2D_DESC mainDesc{};
+        mainTexture->GetDesc(&mainDesc);
+        if (mainDesc.Format != DXGI_FORMAT_R11G11B10_FLOAT) return false;
+
+        ID3D11ComputeShader* previousShader = nullptr;
+        ID3D11ShaderResourceView* previousSRV = nullptr;
+        ID3D11UnorderedAccessView* previousUAV = nullptr;
+        ID3D11RenderTargetView* previousRTV[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+        ID3D11DepthStencilView* previousDSV = nullptr;
+        ctx->CSGetShader(&previousShader, nullptr, nullptr);
+        ctx->CSGetShaderResources(0, 1, &previousSRV);
+        ctx->CSGetUnorderedAccessViews(0, 1, &previousUAV);
+        ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, previousRTV, &previousDSV);
+
+        ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        ctx->CSSetShader(decoder, nullptr, 0);
+        ctx->CSSetShaderResources(0, 1, &outputSRV);
+        ctx->CSSetUnorderedAccessViews(0, 1, &mainUAV, nullptr);
+        ctx->Dispatch((mainDesc.Width + 7) / 8, (mainDesc.Height + 7) / 8, 1);
+
+        ID3D11ShaderResourceView* nullSRV = nullptr;
+        ID3D11UnorderedAccessView* nullUAV = nullptr;
+        ctx->CSSetShaderResources(0, 1, &nullSRV);
+        ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+        ctx->CSSetShader(previousShader, nullptr, 0);
+        ctx->CSSetShaderResources(0, 1, &previousSRV);
+        ctx->CSSetUnorderedAccessViews(0, 1, &previousUAV, nullptr);
+        ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, previousRTV, previousDSV);
+
+        if (previousShader) previousShader->Release();
+        if (previousSRV) previousSRV->Release();
+        if (previousUAV) previousUAV->Release();
+        for (auto* rtv : previousRTV) if (rtv) rtv->Release();
+        if (previousDSV) previousDSV->Release();
+        return true;
+    }
+};
+static Build19PrePostResolve gBuild19PrePostResolve;
+
 }
 
 void SkyrimUpscaler::LoadINI()
@@ -402,6 +541,73 @@ float SkyrimUpscaler::GetVerticalFOVRad()
 	const auto    x = base / 1.30322540f;
 	const auto    vFOV = 2 * atan(x / (float(mRenderSizeX) / mRenderSizeY));
 	return vFOV;
+}
+
+
+// Called by the verified Main_PostProcessing hook, BEFORE Skyrim image-space.
+// If any prerequisite is missing, the old late-frame Build17 path runs instead.
+bool SkyrimUpscaler::EvaluateBeforePostProcessing()
+{
+    if (!mBuild19PostProcessHookInstalled || !mUseBuild19PrePost || !mTryEngineDRSRatios ||
+        !IsEnabled() || mDisableEvaluation || mUpscaleType != DLSS ||
+        mRenderSizeX <= 0 || mRenderSizeY <= 0 || !mDevice || !mContext ||
+        !mTargetTex.mImage || !mMotionVectors.mImage || !mDepthBuffer.mImage ||
+        !mMotionVectorsEmpty.mImage)
+        return false;
+
+    auto* renderer = RE::BSGraphics::Renderer::GetSingleton();
+    if (!renderer) return false;
+    auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    if (!main.texture || !main.UAV) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            logger::warn("Build19 prepost: kMAIN texture or UAV missing, using Build17 fallback");
+        }
+        return false;
+    }
+    auto* mainColor = reinterpret_cast<ID3D11Texture2D*>(main.texture);
+    D3D11_TEXTURE2D_DESC desc{};
+    mainColor->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_R11G11B10_FLOAT ||
+        desc.Width != static_cast<UINT>(mDisplaySizeX) ||
+        desc.Height != static_cast<UINT>(mDisplaySizeY)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            logger::warn("Build19 prepost: kMAIN unexpected: {}x{} fmt={}",
+                desc.Width, desc.Height, static_cast<unsigned int>(desc.Format));
+        }
+        return false;
+    }
+    if (!gBuild19PrePostResolve.Ensure(mDevice, mTargetTex.mImage)) return false;
+
+    // Use exactly the pixels Skyrim rendered under native engine DRS.
+    auto* reducedColor = gBuild18EarlyMain.Execute(mDevice, mContext, mainColor,
+        static_cast<UINT>(mRenderSizeX), static_cast<UINT>(mRenderSizeY));
+    if (!reducedColor) return false;
+
+    static float& nearPlane = (*(float*)(RELOCATION_ID(517032, 403540).address() + 0x40));
+    static float& farPlane = (*(float*)(RELOCATION_ID(517032, 403540).address() + 0x44));
+    ID3D11Texture2D* mask = mEnableTransparentMask ? mTransparentMask.mImage : nullptr;
+    const int jitter = mEnableJitter ? 1 : 0;
+    SimpleEvaluate(0, reducedColor, mMotionVectors.mImage, mDepthBuffer.mImage,
+        mask, gBuild19PrePostResolve.output,
+        mRenderSizeX, mRenderSizeY, mSharpness,
+        mJitterOffsets[0] * jitter, mJitterOffsets[1] * jitter,
+        mMotionScale[0], mMotionScale[1], false,
+        nearPlane / 100.0f, farPlane / 100.0f, GetVerticalFOVRad());
+
+    if (!gBuild19PrePostResolve.DecodeToMain(mContext, mainColor, main.UAV))
+        return false;
+    // Keep motion vectors intact through Skyrim's native image-space stage.
+    static unsigned int successCount = 0;
+    if (successCount++ < 8) {
+        logger::info("Build19 prepost APPLIED: kMAIN {}x{} HDR -> {}x{} RGBA8 -> MetalFX {}x{} -> HDR kMAIN; native image-space follows",
+            desc.Width, desc.Height, mRenderSizeX, mRenderSizeY,
+            mDisplaySizeX, mDisplaySizeY);
+    }
+    return true;
 }
 
 void SkyrimUpscaler::EvaluateUpscaler(ID3D11Texture2D* source)

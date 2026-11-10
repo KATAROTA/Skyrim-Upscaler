@@ -12,6 +12,7 @@ on:
       - fix-metalfx-gpu-input-b16
       - fix-skyrim-engine-drs-b17
       - experiment-metalfx-kmain-b18
+      - experiment-metalfx-prepost-b19
   workflow_dispatch:
 
 jobs:

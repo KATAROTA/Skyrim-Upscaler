@@ -10,6 +10,8 @@
 #include "DRS.h"
 #include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 
 static float                                                        mipLodBias = 0;
 static std::unordered_set<ID3D11SamplerState*>                      passThroughSamplers;
@@ -408,11 +410,65 @@ struct UpscalerHooks
 					SkyrimUpscaler::GetSingleton()->SetupTarget(targetTex);
 				}
 			}
-			SkyrimUpscaler::GetSingleton()->EvaluateUpscaler();
+			auto* upscaler = SkyrimUpscaler::GetSingleton();
+			if (!upscaler->mBuild19EarlyAppliedThisFrame) {
+				upscaler->EvaluateUpscaler();
+			} else if (upscaler->mContext && upscaler->mMotionVectors.mImage &&
+				upscaler->mMotionVectorsEmpty.mImage) {
+				upscaler->mContext->CopyResource(upscaler->mMotionVectors.mImage,
+					upscaler->mMotionVectorsEmpty.mImage);
+			}
+			upscaler->mBuild19EarlyAppliedThisFrame = false;
 			func(BSGraphics_Renderer, unk);
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
+
+
+    // Build19: Community Shaders uses this exact pre-image-space call site.
+    // Never call the original late evaluator after successful early dispatch.
+    struct Main_PostProcessing_Build19
+    {
+        static void thunk(RE::ImageSpaceManager* a_this, std::uint32_t a3,
+            RE::RENDER_TARGET a_target, void* a4, bool a5)
+        {
+            auto* upscaler = SkyrimUpscaler::GetSingleton();
+            upscaler->mBuild19EarlyAppliedThisFrame = false;
+            const bool applied = upscaler->EvaluateBeforePostProcessing();
+            upscaler->mBuild19EarlyAppliedThisFrame = applied;
+            if (applied) {
+                // Skyrim now reads an upscaled HDR kMAIN, so its image-space stage
+                // must process the FULL display viewport instead of the DRS rectangle.
+                auto* raw = RE::BSGraphics::State::GetSingleton();
+                if (raw) {
+                    auto* state = reinterpret_cast<BSGraphics::State*>(raw);
+                    auto& runtime = state->GetRuntimeData();
+                    const auto oldWidth = runtime.fDynamicResolutionCurrentWidthScale;
+                    const auto oldHeight = runtime.fDynamicResolutionCurrentHeightScale;
+                    const auto oldPrevWidth = runtime.fDynamicResolutionPreviousWidthScale;
+                    const auto oldPrevHeight = runtime.fDynamicResolutionPreviousHeightScale;
+                    const auto oldRatioWidth = runtime.fDynamicResolutionWidthRatio;
+                    const auto oldRatioHeight = runtime.fDynamicResolutionHeightRatio;
+                    runtime.fDynamicResolutionCurrentWidthScale = 1.0f;
+                    runtime.fDynamicResolutionCurrentHeightScale = 1.0f;
+                    runtime.fDynamicResolutionPreviousWidthScale = 1.0f;
+                    runtime.fDynamicResolutionPreviousHeightScale = 1.0f;
+                    runtime.fDynamicResolutionWidthRatio = 1.0f;
+                    runtime.fDynamicResolutionHeightRatio = 1.0f;
+                    func(a_this, a3, a_target, a4, a5);
+                    runtime.fDynamicResolutionCurrentWidthScale = oldWidth;
+                    runtime.fDynamicResolutionCurrentHeightScale = oldHeight;
+                    runtime.fDynamicResolutionPreviousWidthScale = oldPrevWidth;
+                    runtime.fDynamicResolutionPreviousHeightScale = oldPrevHeight;
+                    runtime.fDynamicResolutionWidthRatio = oldRatioWidth;
+                    runtime.fDynamicResolutionHeightRatio = oldRatioHeight;
+                    return;
+                }
+            }
+            func(a_this, a3, a_target, a4, a5);
+        }
+        static inline REL::Relocation<decltype(thunk)> func;
+    };
 
 	struct BSImagespaceShader_Hook_VR
 	{
@@ -543,6 +599,45 @@ struct UpscalerHooks
 			REL::safe_write<uint8_t>(buildCameraStateDataHook.address() + REL::Relocate(0x1D5, 0x1D6), patch2);
 			// Pre-UI Hook for upscaling, only for flatrim
 			stl::write_thunk_call<Main_DrawWorld_MainDraw>(REL::RelocationID(79947, 82084).address() + REL::Relocate(0x16F, 0x17A, 0x132));  // EBF510 (EBF67F), F05BF0 (F05D6A)
+
+            // Early post-processing hook is optional: skip if the site is patched or
+            // does not resolve to an executable function in this exact runtime.
+            const auto site = REL::RelocationID(100430, 107148).address() + REL::Relocate(0x1F0, 0x1E7);
+            const auto* call = reinterpret_cast<const std::uint8_t*>(site);
+            bool safeCall = call[0] == 0xE8;
+            if (safeCall) {
+                std::int32_t disp = 0;
+                std::memcpy(&disp, call + 1, sizeof(disp));
+                const auto target = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(site + 5) + disp);
+                MEMORY_BASIC_INFORMATION memory{};
+                if (!VirtualQuery(reinterpret_cast<LPCVOID>(target), &memory, sizeof(memory)))
+                    safeCall = false;
+                else {
+                    const DWORD allowed = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+                    safeCall = (memory.State == MEM_COMMIT) && (memory.Protect & allowed);
+                }
+                if (safeCall) {
+                    // Reject an already-hooked call to a foreign module/trampoline.
+                    const auto module = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+                    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+                    if (!module || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+                        safeCall = false;
+                    } else {
+                        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(module + dos->e_lfanew);
+                        safeCall = nt->Signature == IMAGE_NT_SIGNATURE &&
+                            target >= module && (target - module) < nt->OptionalHeader.SizeOfImage;
+                    }
+                }
+                if (safeCall) {
+                    stl::write_thunk_call<Main_PostProcessing_Build19>(site);
+                    SkyrimUpscaler::GetSingleton()->mBuild19PostProcessHookInstalled = true;
+                    logger::info("Build19 prepost hook INSTALLED at 0x{:X}, original target=0x{:X}", site, target);
+                }
+            }
+            if (!safeCall)
+                logger::warn("Build19 prepost hook SKIPPED: unverified or non-executable call site 0x{:X}; Build17 fallback active", site);
+
 		} else {
 			REL::safe_write<uint8_t>(updateJitterHook.address() + 0x17, patch2);
 			REL::safe_write<uint8_t>(buildCameraStateDataHook.address() + 0x34, patch3);

@@ -121,6 +121,9 @@ public:
 	int   mQualityLevel{ 0 };
 	float mMipLodBias{ 0 };
 
+	bool mUseBuild19PrePost{ false };  // Build 19: GPU upscale before native image-space processing
+	bool mBuild19PostProcessHookInstalled{ false };
+	bool mBuild19EarlyAppliedThisFrame{ false };
 	bool mUseBuild18EarlyMain{ false };  // Build 18: experimental HDR world buffer -> MetalFX input
 	bool mTryEngineDRSRatios{ false };  // Build 17: optional test of Skyrim DRS viewport ratios
 	bool mUseMetalFXGpuDownsample{ true };  // Build 16: downsample full color frame on GPU before MetalFX
@@ -158,6 +161,7 @@ public:
 
 	float GetVerticalFOVRad();
 	void  EvaluateUpscaler(ID3D11Texture2D* source = nullptr);
+	bool  EvaluateBeforePostProcessing();
 
 	bool IsEnabled();
 
