@@ -25,7 +25,7 @@
 namespace {
 struct Build16GpuDownsample
 {
-    ID3D11Texture2D* small = nullptr;
+    ID3D11Texture2D* smallTexture = nullptr;
     ID3D11ShaderResourceView* fullSRV = nullptr;
     ID3D11UnorderedAccessView* smallUAV = nullptr;
     ID3D11ComputeShader* cs = nullptr;
@@ -56,8 +56,8 @@ struct Build16GpuDownsample
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-        HRESULT hr = dev->CreateTexture2D(&desc, nullptr, &small);
-        if (FAILED(hr) || !small) {
+        HRESULT hr = dev->CreateTexture2D(&desc, nullptr, &smallTexture);
+        if (FAILED(hr) || !smallTexture) {
             logger::error("Build16 downsample: CreateTexture2D failed 0x{:08X}", static_cast<unsigned int>(hr));
             return false;
         }
@@ -66,7 +66,7 @@ struct Build16GpuDownsample
             logger::error("Build16 downsample: input SRV failed 0x{:08X}", static_cast<unsigned int>(hr));
             return false;
         }
-        hr = dev->CreateUnorderedAccessView(small, nullptr, &smallUAV);
+        hr = dev->CreateUnorderedAccessView(smallTexture, nullptr, &smallUAV);
         if (FAILED(hr) || !smallUAV) {
             logger::error("Build16 downsample: output UAV failed 0x{:08X}", static_cast<unsigned int>(hr));
             return false;
@@ -167,7 +167,7 @@ void main(uint3 id : SV_DispatchThreadID)
         if (previousSRV) previousSRV->Release();
         if (previousUAV) previousUAV->Release();
         if (previousSampler) previousSampler->Release();
-        return small;
+        return smallTexture;
     }
 };
 static Build16GpuDownsample gBuild16Downsample;
