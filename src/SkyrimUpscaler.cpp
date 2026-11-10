@@ -4,6 +4,7 @@
 #include <ReShadePlugin.h>
 #include <cmath>
 #include <d3dcompiler.h>
+#include <RE/R/Renderer.h>
 #include <cstring>
 
 
@@ -171,6 +172,151 @@ void main(uint3 id : SV_DispatchThreadID)
     }
 };
 static Build16GpuDownsample gBuild16Downsample;
+
+// Build 18: optional EARLY INPUT experiment. kMAIN is R11G11B10_FLOAT (HDR),
+// not the final SDR backbuffer. Only the active DRS rectangle is sampled.
+// This is not a final HDR/tone-mapping solution: user must compare colours.
+struct Build18EarlyMain
+{
+    ID3D11Texture2D* output = nullptr;
+    ID3D11Texture2D* sourceTexture = nullptr;
+    ID3D11ShaderResourceView* sourceSRV = nullptr;
+    ID3D11UnorderedAccessView* outputUAV = nullptr;
+    ID3D11ComputeShader* shader = nullptr;
+    bool attempted = false;
+    bool ready = false;
+
+    bool Ensure(ID3D11Device* dev, ID3D11Texture2D* src, UINT width, UINT height)
+    {
+        if (ready) return src == sourceTexture;
+        if (attempted || !dev || !src || !width || !height) return false;
+        attempted = true;
+        D3D11_TEXTURE2D_DESC sd{};
+        src->GetDesc(&sd);
+        if (sd.Format != DXGI_FORMAT_R11G11B10_FLOAT ||
+            !(sd.BindFlags & D3D11_BIND_SHADER_RESOURCE) ||
+            sd.Width < width || sd.Height < height ||
+            sd.SampleDesc.Count != 1) {
+            logger::warn("Build18 kMAIN rejected: {}x{} format={} bind=0x{:X}, requested={}x{}",
+                sd.Width, sd.Height, static_cast<unsigned int>(sd.Format), sd.BindFlags, width, height);
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC od{};
+        od.Width = width;
+        od.Height = height;
+        od.ArraySize = 1;
+        od.MipLevels = 1;
+        od.SampleDesc.Count = 1;
+        od.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        od.Usage = D3D11_USAGE_DEFAULT;
+        od.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        HRESULT hr = dev->CreateTexture2D(&od, nullptr, &output);
+        if (FAILED(hr) || !output) {
+            logger::error("Build18 kMAIN: output texture allocation failed HRESULT=0x{:08X}", static_cast<unsigned int>(hr));
+            return false;
+        }
+        hr = dev->CreateShaderResourceView(src, nullptr, &sourceSRV);
+        if (FAILED(hr) || !sourceSRV) {
+            logger::error("Build18 kMAIN: source SRV creation failed HRESULT=0x{:08X}", static_cast<unsigned int>(hr));
+            return false;
+        }
+        hr = dev->CreateUnorderedAccessView(output, nullptr, &outputUAV);
+        if (FAILED(hr) || !outputUAV) {
+            logger::error("Build18 kMAIN: output UAV creation failed HRESULT=0x{:08X}", static_cast<unsigned int>(hr));
+            return false;
+        }
+        HMODULE dll = LoadLibraryA("d3dcompiler_47.dll");
+        if (!dll) {
+            logger::error("Build18 kMAIN: d3dcompiler_47.dll missing");
+            return false;
+        }
+        using CompileFn = decltype(&D3DCompile);
+        auto compile = reinterpret_cast<CompileFn>(GetProcAddress(dll, "D3DCompile"));
+        if (!compile) {
+            logger::error("Build18 kMAIN: D3DCompile missing");
+            return false;
+        }
+        static constexpr char srcCode[] = R"HLSL(
+Texture2D<float4> SceneHDR : register(t0);
+RWTexture2D<float4> SmallSDR : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID)
+{
+    uint w, h;
+    SmallSDR.GetDimensions(w, h);
+    if (tid.x >= w || tid.y >= h) return;
+    // IMPORTANT: Load, not SampleLevel: the native engine already rendered the
+    // reduced scene into this region. Resampling the full HDR image would re-zoom.
+    float3 hdr = max(SceneHDR.Load(int3(tid.xy, 0)).rgb, 0.0f);
+    // TEMPORARY tone mapping; cannot reproduce Skyrim's image-space effects.
+    float3 mapped = hdr / (1.0f + hdr);
+    float3 displayColor = pow(saturate(mapped), 1.0f / 2.2f);
+    SmallSDR[tid.xy] = float4(displayColor, 1.0f);
+}
+)HLSL";
+        ID3DBlob* code = nullptr;
+        ID3DBlob* errors = nullptr;
+        hr = compile(srcCode, std::strlen(srcCode), "Build18EarlyMain", nullptr, nullptr,
+            "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+        if (FAILED(hr) || !code) {
+            logger::error("Build18 kMAIN: HLSL compile failed HRESULT=0x{:08X}: {}",
+                static_cast<unsigned int>(hr),
+                errors ? std::string(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize()) : "no compiler message");
+            if (errors) errors->Release();
+            if (code) code->Release();
+            return false;
+        }
+        if (errors) errors->Release();
+        hr = dev->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &shader);
+        code->Release();
+        if (FAILED(hr) || !shader) {
+            logger::error("Build18 kMAIN: compute shader creation failed HRESULT=0x{:08X}", static_cast<unsigned int>(hr));
+            return false;
+        }
+        sourceTexture = src;
+        ready = true;
+        logger::info("Build18 kMAIN prepared: HDR {}x{} -> SDR {}x{} (pre-postprocessing EXPERIMENT)",
+            sd.Width, sd.Height, width, height);
+        return true;
+    }
+
+    ID3D11Texture2D* Execute(ID3D11Device* dev, ID3D11DeviceContext* ctx,
+        ID3D11Texture2D* src, UINT width, UINT height)
+    {
+        if (!ctx || !Ensure(dev, src, width, height)) return nullptr;
+        ID3D11ComputeShader* oldShader = nullptr;
+        ID3D11ShaderResourceView* oldSRV = nullptr;
+        ID3D11UnorderedAccessView* oldUAV = nullptr;
+        ID3D11RenderTargetView* oldRTV[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+        ID3D11DepthStencilView* oldDSV = nullptr;
+        ctx->CSGetShader(&oldShader, nullptr, nullptr);
+        ctx->CSGetShaderResources(0, 1, &oldSRV);
+        ctx->CSGetUnorderedAccessViews(0, 1, &oldUAV);
+        ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, oldRTV, &oldDSV);
+
+        // Avoid an SRV / RTV feedback hazard if the HDR scene is still bound.
+        ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        ctx->CSSetShader(shader, nullptr, 0);
+        ctx->CSSetShaderResources(0, 1, &sourceSRV);
+        ctx->CSSetUnorderedAccessViews(0, 1, &outputUAV, nullptr);
+        ctx->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+        ID3D11ShaderResourceView* nullSRV = nullptr;
+        ID3D11UnorderedAccessView* nullUAV = nullptr;
+        ctx->CSSetShaderResources(0, 1, &nullSRV);
+        ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+        ctx->CSSetShader(oldShader, nullptr, 0);
+        ctx->CSSetShaderResources(0, 1, &oldSRV);
+        ctx->CSSetUnorderedAccessViews(0, 1, &oldUAV, nullptr);
+        ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, oldRTV, oldDSV);
+        if (oldShader) oldShader->Release();
+        if (oldSRV) oldSRV->Release();
+        if (oldUAV) oldUAV->Release();
+        for (auto* rtv : oldRTV) if (rtv) rtv->Release();
+        if (oldDSV) oldDSV->Release();
+        return output;
+    }
+};
+static Build18EarlyMain gBuild18EarlyMain;
 }
 
 void SkyrimUpscaler::LoadINI()
@@ -277,14 +423,38 @@ void SkyrimUpscaler::EvaluateUpscaler(ID3D11Texture2D* source)
 				// For DLSS to work in borderless mode we must copy the backbuffer to a temporary texture
 				if (source == nullptr)
 					source = mTargetTex.mImage;
-				mContext->CopyResource(mTempColor.mImage, source);
+				// Build18: defer the full-frame copy until the fallback SDR path is actually used.
 				int j = (mEnableJitter) ? 1 : 0;
 				if (!mDisableEvaluation) {
 					bool fullInput = mForceMetalFXFullInput && (mUpscaleType == DLSS || mUpscaleType == DLAA);
 					int inputWidth = fullInput ? mDisplaySizeX : mRenderSizeX;
 					int inputHeight = fullInput ? mDisplaySizeY : mRenderSizeY;
 					ID3D11Texture2D* evaluationColor = mTempColor.mImage;
-					if (mUpscaleType == DLSS && !fullInput && mUseMetalFXGpuDownsample) {
+                    bool usedEarlyMain = false;
+                    if (mUpscaleType == DLSS && !fullInput &&
+                        mTryEngineDRSRatios && mUseBuild18EarlyMain) {
+                        auto* renderer = RE::BSGraphics::Renderer::GetSingleton();
+                        if (renderer) {
+                            // Use the renderer-owned kMAIN, never an unverified fixed address.
+                            auto* rawMain = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN].texture;
+                            auto* mainColor = reinterpret_cast<ID3D11Texture2D*>(rawMain);
+                            if (mainColor) {
+                                if (auto* smallColor = gBuild18EarlyMain.Execute(mDevice, mContext, mainColor,
+                                    static_cast<UINT>(mRenderSizeX), static_cast<UINT>(mRenderSizeY))) {
+                                    evaluationColor = smallColor;
+                                    usedEarlyMain = true;
+                                }
+                            }
+                        }
+                        static bool warned = false;
+                        if (!usedEarlyMain && !warned) {
+                            logger::warn("Build18 kMAIN unavailable or incompatible; using Build16 SDR fallback");
+                            warned = true;
+                        }
+                    }
+                    if (!usedEarlyMain)
+                        mContext->CopyResource(mTempColor.mImage, source);
+					if (!usedEarlyMain && mUpscaleType == DLSS && !fullInput && mUseMetalFXGpuDownsample) {
 						if (auto* resized = gBuild16Downsample.Execute(mDevice, mContext, mTempColor.mImage,
 							static_cast<UINT>(mRenderSizeX), static_cast<UINT>(mRenderSizeY))) {
 							evaluationColor = resized;
@@ -304,9 +474,9 @@ void SkyrimUpscaler::EvaluateUpscaler(ID3D11Texture2D* source)
 					if (diagCount++ < 5) {
 						D3D11_TEXTURE2D_DESC actualInputDesc{};
 						evaluationColor->GetDesc(&actualInputDesc);
-						logger::info("Build16 MetalFX source: texture={}x{} declared={}x{} gpuResample={} fullInput={}",
+						logger::info("Build18 MetalFX source: texture={}x{} declared={}x{} gpuResample={} fullInput={} earlyMain={}",
 							actualInputDesc.Width, actualInputDesc.Height, inputWidth, inputHeight,
-							evaluationColor != mTempColor.mImage, fullInput);
+							evaluationColor != mTempColor.mImage && !usedEarlyMain, fullInput, usedEarlyMain);
 						D3D11_TEXTURE2D_DESC srcDesc{}, dstDesc{}, mvDesc{}, depthDesc{};
 						mTempColor.mImage->GetDesc(&srcDesc);
 						mTargetTex.mImage->GetDesc(&dstDesc);

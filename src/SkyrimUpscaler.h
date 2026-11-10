@@ -121,6 +121,7 @@ public:
 	int   mQualityLevel{ 0 };
 	float mMipLodBias{ 0 };
 
+	bool mUseBuild18EarlyMain{ false };  // Build 18: experimental HDR world buffer -> MetalFX input
 	bool mTryEngineDRSRatios{ false };  // Build 17: optional test of Skyrim DRS viewport ratios
 	bool mUseMetalFXGpuDownsample{ true };  // Build 16: downsample full color frame on GPU before MetalFX
 	bool mForceMetalFXFullInput{ false };  // Temporary diagnostic: treat entire source texture as input content

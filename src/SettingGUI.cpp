@@ -158,6 +158,12 @@ void SettingGUI::OnRender()
         }
         ImGui::EndDisabled();
         ImGui::TextDisabled("Build 17: writes Skyrim runtime ratio fields; OFF restores native ratios.");
+        ImGui::BeginDisabled(!upscaler->mUpscalerReady || upscaler->mUpscaleType != DLSS || !upscaler->mTryEngineDRSRatios);
+        if (ImGui::Checkbox("EXPERIMENT: use kMAIN HDR region (Build 18)", &upscaler->mUseBuild18EarlyMain)) {
+            logger::info("Build18 early kMAIN input experiment: {}", upscaler->mUseBuild18EarlyMain);
+        }
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("Experimental colour path; may look different. OFF = Build17 rendering.");
 		ImGui::Checkbox("DEBUG: record DRS viewport/scissor", &upscaler->mTraceRasterStats);
 		ImGui::TextDisabled("Read-only raster probe; logs every 120 presented frames.");
 		ImGui::BeginDisabled(!upscaler->mUpscalerReady);

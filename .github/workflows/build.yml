@@ -11,6 +11,7 @@ on:
       - probe-metalfx-render-regions-b15
       - fix-metalfx-gpu-input-b16
       - fix-skyrim-engine-drs-b17
+      - experiment-metalfx-kmain-b18
   workflow_dispatch:
 
 jobs:
