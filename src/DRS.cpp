@@ -52,27 +52,61 @@ void DRS::ResetScale()
 
 void DRS::SetDRS(BSGraphics::State* a_state)
 {
-	if (REL::Module::IsVR()) {
-		SetDRSVR(currentScaleFactor);
-	}
-	auto& runtimeData = a_state->GetRuntimeData();
-	const float oldWidth = runtimeData.fDynamicResolutionCurrentWidthScale;
-	const float oldHeight = runtimeData.fDynamicResolutionCurrentHeightScale;
-	runtimeData.fDynamicResolutionCurrentHeightScale = currentScaleFactor;
-	runtimeData.fDynamicResolutionCurrentWidthScale = currentScaleFactor;
-	static int diagnosticFrames = 0;
-	static float lastDiagnosticScale = -1.0f;
-	if (lastDiagnosticScale != currentScaleFactor) {
-		lastDiagnosticScale = currentScaleFactor;
-		diagnosticFrames = 0;
-	}
-	if (diagnosticFrames++ < 12) {
-		logger::info("DRS hook: requested={} oldWidth={} oldHeight={} appliedWidth={} appliedHeight={} stateOffset=0x{:X}",
-			currentScaleFactor, oldWidth, oldHeight,
-			runtimeData.fDynamicResolutionCurrentWidthScale, runtimeData.fDynamicResolutionCurrentHeightScale,
-			static_cast<unsigned int>(reinterpret_cast<std::uintptr_t>(&runtimeData) - reinterpret_cast<std::uintptr_t>(a_state)));
-	}
-	lastScaleFactor = currentScaleFactor;
+    if (REL::Module::IsVR()) {
+        SetDRSVR(currentScaleFactor);
+    }
+
+    auto& runtimeData = a_state->GetRuntimeData();
+    const float oldWidth = runtimeData.fDynamicResolutionCurrentWidthScale;
+    const float oldHeight = runtimeData.fDynamicResolutionCurrentHeightScale;
+    const float oldRatioX = runtimeData.fDynamicResolutionWidthRatio;
+    const float oldRatioY = runtimeData.fDynamicResolutionHeightRatio;
+
+    // Build 16 wrote only CurrentWidth/HeightScale. In Community Shaders,
+    // Skyrim's upscaling path additionally writes the runtime Width/HeightRatio
+    // and their previous-frame counterparts. Probe these fields ONLY when opted in.
+    auto* upscaler = SkyrimUpscaler::GetSingleton();
+    const bool experimental = upscaler->mTryEngineDRSRatios &&
+        upscaler->mUpscalerReady && upscaler->mUpscaleType == DLSS;
+    static bool wasExperimental = false;
+    const float scale = (currentScaleFactor >= 0.5f && currentScaleFactor <= 1.0f)
+        ? currentScaleFactor : 1.0f;
+    const float effectiveRatio = experimental ? scale : 1.0f;
+
+    runtimeData.fDynamicResolutionCurrentWidthScale = scale;
+    runtimeData.fDynamicResolutionCurrentHeightScale = scale;
+
+    if (experimental || wasExperimental) {
+        // Keep previous ratios synchronized with the values used in the prior frame.
+        // When the experiment is switched off, restore 1.0 without restarting Skyrim.
+        runtimeData.fDynamicResolutionPreviousWidthScale = oldRatioX;
+        runtimeData.fDynamicResolutionPreviousHeightScale = oldRatioY;
+        runtimeData.fDynamicResolutionWidthRatio = effectiveRatio;
+        runtimeData.fDynamicResolutionHeightRatio = effectiveRatio;
+    }
+
+    static int diagnosticFrames = 0;
+    static float lastDiagnosticScale = -1.0f;
+    static bool lastExperimental = false;
+    if (lastDiagnosticScale != scale || lastExperimental != experimental) {
+        lastDiagnosticScale = scale;
+        lastExperimental = experimental;
+        diagnosticFrames = 0;
+    }
+    if (diagnosticFrames++ < 8) {
+        logger::info("Build17 DRS: experimental={} requested={} current {}x{} -> {}x{} ratio {}x{} -> {}x{} previous={}x{} stateOffset=0x{:X}",
+            experimental, scale, oldWidth, oldHeight,
+            runtimeData.fDynamicResolutionCurrentWidthScale,
+            runtimeData.fDynamicResolutionCurrentHeightScale,
+            oldRatioX, oldRatioY,
+            runtimeData.fDynamicResolutionWidthRatio,
+            runtimeData.fDynamicResolutionHeightRatio,
+            runtimeData.fDynamicResolutionPreviousWidthScale,
+            runtimeData.fDynamicResolutionPreviousHeightScale,
+            static_cast<unsigned int>(reinterpret_cast<std::uintptr_t>(&runtimeData) - reinterpret_cast<std::uintptr_t>(a_state)));
+    }
+    wasExperimental = experimental;
+    lastScaleFactor = scale;
 }
 
 void DRS::MessageHandler(SKSE::MessagingInterface::Message* a_msg)

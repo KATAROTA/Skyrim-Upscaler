@@ -10,6 +10,7 @@ on:
       - probe-metalfx-drs-raster
       - probe-metalfx-render-regions-b15
       - fix-metalfx-gpu-input-b16
+      - fix-skyrim-engine-drs-b17
   workflow_dispatch:
 
 jobs:

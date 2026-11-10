@@ -151,7 +151,13 @@ void SettingGUI::OnRender()
 		ImGui::BeginDisabled(!upscaler->mUpscalerReady || upscaler->mUpscaleType != DLSS);
 		ImGui::Checkbox("MetalFX: GPU-resize source (fix zoom)", &upscaler->mUseMetalFXGpuDownsample);
 		ImGui::EndDisabled();
-		ImGui::TextDisabled("Build 16: correct 1371x886 input; no engine FPS boost yet.");
+		ImGui::TextDisabled("Build 16: input image matches declared MetalFX size.");
+        ImGui::BeginDisabled(!upscaler->mUpscalerReady || upscaler->mUpscaleType != DLSS);
+        if (ImGui::Checkbox("ENGINE: try DRS render ratios (experimental)", &upscaler->mTryEngineDRSRatios)) {
+            logger::info("Build17 engine DRS ratio experiment: {}", upscaler->mTryEngineDRSRatios);
+        }
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("Build 17: writes Skyrim runtime ratio fields; OFF restores native ratios.");
 		ImGui::Checkbox("DEBUG: record DRS viewport/scissor", &upscaler->mTraceRasterStats);
 		ImGui::TextDisabled("Read-only raster probe; logs every 120 presented frames.");
 		ImGui::BeginDisabled(!upscaler->mUpscalerReady);
