@@ -3,6 +3,8 @@
 #include <DRS.h>
 #include <ReShadePlugin.h>
 #include <cmath>
+#include <d3dcompiler.h>
+#include <cstring>
 
 
 #define GetSettingInt(a_section, a_setting, a_default) a_setting = (int)ini.GetLongValue(a_section, #a_setting, a_default);
@@ -13,6 +15,163 @@
 
 #define GetSettingBool(a_section, a_setting, a_default) a_setting = ini.GetBoolValue(a_section, #a_setting, a_default);
 #define SetSettingBool(a_section, a_setting) ini.SetBoolValue(a_section, #a_setting, a_setting);
+
+
+// Build 16: correct the COLOR input shape, not just the metadata passed to NVNGX.
+// DXMT/MetalFX reads InputContentWidth/Height from the NGX evaluation parameters.
+// Passing a full-size rendered image with smaller metadata crops/zooms the image.
+// This GPU pass makes a genuinely smaller source texture. It does not yet cause
+// Skyrim's own draw calls to render at lower resolution, so it is not a FPS fix.
+namespace {
+struct Build16GpuDownsample
+{
+    ID3D11Texture2D* small = nullptr;
+    ID3D11ShaderResourceView* fullSRV = nullptr;
+    ID3D11UnorderedAccessView* smallUAV = nullptr;
+    ID3D11ComputeShader* cs = nullptr;
+    ID3D11SamplerState* sampler = nullptr;
+    bool attempted = false;
+    bool ready = false;
+
+    bool Ensure(ID3D11Device* dev, ID3D11Texture2D* full, UINT width, UINT height)
+    {
+        if (ready) return true;
+        if (attempted || !dev || !full || !width || !height) return false;
+        attempted = true;
+        D3D11_TEXTURE2D_DESC sourceDesc{};
+        full->GetDesc(&sourceDesc);
+        if (sourceDesc.Format != DXGI_FORMAT_R8G8B8A8_UNORM ||
+            !(sourceDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+            logger::error("Build16 downsample: full color texture does not support RGBA8 SRV, format={} bind=0x{:X}",
+                static_cast<unsigned int>(sourceDesc.Format), sourceDesc.BindFlags);
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        HRESULT hr = dev->CreateTexture2D(&desc, nullptr, &small);
+        if (FAILED(hr) || !small) {
+            logger::error("Build16 downsample: CreateTexture2D failed 0x{:08X}", static_cast<unsigned int>(hr));
+            return false;
+        }
+        hr = dev->CreateShaderResourceView(full, nullptr, &fullSRV);
+        if (FAILED(hr) || !fullSRV) {
+            logger::error("Build16 downsample: input SRV failed 0x{:08X}", static_cast<unsigned int>(hr));
+            return false;
+        }
+        hr = dev->CreateUnorderedAccessView(small, nullptr, &smallUAV);
+        if (FAILED(hr) || !smallUAV) {
+            logger::error("Build16 downsample: output UAV failed 0x{:08X}", static_cast<unsigned int>(hr));
+            return false;
+        }
+        D3D11_SAMPLER_DESC samp{};
+        samp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        samp.AddressU = samp.AddressV = samp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        samp.MaxAnisotropy = 1;
+        samp.ComparisonFunc = D3D11_COMPARISON_ALWAYS;
+        samp.MinLOD = 0.0f;
+        samp.MaxLOD = D3D11_FLOAT32_MAX;
+        hr = dev->CreateSamplerState(&samp, &sampler);
+        if (FAILED(hr) || !sampler) {
+            logger::error("Build16 downsample: sampler failed 0x{:08X}", static_cast<unsigned int>(hr));
+            return false;
+        }
+
+        // Use the Windows/Wine shader compiler at runtime. No bundled binaries.
+        HMODULE dll = LoadLibraryA("d3dcompiler_47.dll");
+        if (!dll) {
+            logger::error("Build16 downsample: d3dcompiler_47.dll is unavailable; using safe full-input fallback");
+            return false;
+        }
+        using CompileFn = decltype(&D3DCompile);
+        auto compile = reinterpret_cast<CompileFn>(GetProcAddress(dll, "D3DCompile"));
+        if (!compile) {
+            logger::error("Build16 downsample: D3DCompile export not found");
+            return false;
+        }
+        static constexpr char shader[] = R"HLSL(
+Texture2D<float4> InputColor : register(t0);
+RWTexture2D<float4> OutputColor : register(u0);
+SamplerState LinearClamp : register(s0);
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    OutputColor.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    float2 uv = (float2(id.xy) + 0.5f) / float2(w, h);
+    OutputColor[id.xy] = InputColor.SampleLevel(LinearClamp, uv, 0.0f);
+}
+)HLSL";
+        ID3DBlob* bytecode = nullptr;
+        ID3DBlob* errors = nullptr;
+        hr = compile(shader, std::strlen(shader), "Build16ColorDownsample", nullptr, nullptr,
+            "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &bytecode, &errors);
+        if (FAILED(hr) || !bytecode) {
+            logger::error("Build16 downsample: HLSL compilation failed 0x{:08X}: {}",
+                static_cast<unsigned int>(hr),
+                errors ? std::string(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize()) : "no compiler diagnostics");
+            if (errors) errors->Release();
+            if (bytecode) bytecode->Release();
+            return false;
+        }
+        if (errors) errors->Release();
+        hr = dev->CreateComputeShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(), nullptr, &cs);
+        bytecode->Release();
+        if (FAILED(hr) || !cs) {
+            logger::error("Build16 downsample: CreateComputeShader failed 0x{:08X}", static_cast<unsigned int>(hr));
+            return false;
+        }
+        ready = true;
+        logger::info("Build16 GPU downsample ready: {}x{} -> {}x{}, format=RGBA8",
+            sourceDesc.Width, sourceDesc.Height, width, height);
+        return true;
+    }
+
+    ID3D11Texture2D* Execute(ID3D11Device* dev, ID3D11DeviceContext* ctx,
+        ID3D11Texture2D* full, UINT width, UINT height)
+    {
+        if (!ctx || !Ensure(dev, full, width, height)) return nullptr;
+        ID3D11ComputeShader* previousShader = nullptr;
+        ID3D11ShaderResourceView* previousSRV = nullptr;
+        ID3D11UnorderedAccessView* previousUAV = nullptr;
+        ID3D11SamplerState* previousSampler = nullptr;
+        ctx->CSGetShader(&previousShader, nullptr, nullptr);
+        ctx->CSGetShaderResources(0, 1, &previousSRV);
+        ctx->CSGetUnorderedAccessViews(0, 1, &previousUAV);
+        ctx->CSGetSamplers(0, 1, &previousSampler);
+
+        ctx->CSSetShader(cs, nullptr, 0);
+        ctx->CSSetShaderResources(0, 1, &fullSRV);
+        ctx->CSSetUnorderedAccessViews(0, 1, &smallUAV, nullptr);
+        ctx->CSSetSamplers(0, 1, &sampler);
+        ctx->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+
+        ID3D11ShaderResourceView* nullSRV = nullptr;
+        ID3D11UnorderedAccessView* nullUAV = nullptr;
+        ctx->CSSetShaderResources(0, 1, &nullSRV);
+        ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+        ctx->CSSetShader(previousShader, nullptr, 0);
+        ctx->CSSetShaderResources(0, 1, &previousSRV);
+        ctx->CSSetUnorderedAccessViews(0, 1, &previousUAV, nullptr);
+        ctx->CSSetSamplers(0, 1, &previousSampler);
+
+        if (previousShader) previousShader->Release();
+        if (previousSRV) previousSRV->Release();
+        if (previousUAV) previousUAV->Release();
+        if (previousSampler) previousSampler->Release();
+        return small;
+    }
+};
+static Build16GpuDownsample gBuild16Downsample;
+}
 
 void SkyrimUpscaler::LoadINI()
 {
@@ -121,9 +280,21 @@ void SkyrimUpscaler::EvaluateUpscaler(ID3D11Texture2D* source)
 				mContext->CopyResource(mTempColor.mImage, source);
 				int j = (mEnableJitter) ? 1 : 0;
 				if (!mDisableEvaluation) {
-					const bool fullInput = mForceMetalFXFullInput && (mUpscaleType == DLSS || mUpscaleType == DLAA);
-					const int inputWidth = fullInput ? mDisplaySizeX : mRenderSizeX;
-					const int inputHeight = fullInput ? mDisplaySizeY : mRenderSizeY;
+					bool fullInput = mForceMetalFXFullInput && (mUpscaleType == DLSS || mUpscaleType == DLAA);
+					int inputWidth = fullInput ? mDisplaySizeX : mRenderSizeX;
+					int inputHeight = fullInput ? mDisplaySizeY : mRenderSizeY;
+					ID3D11Texture2D* evaluationColor = mTempColor.mImage;
+					if (mUpscaleType == DLSS && !fullInput && mUseMetalFXGpuDownsample) {
+						if (auto* resized = gBuild16Downsample.Execute(mDevice, mContext, mTempColor.mImage,
+							static_cast<UINT>(mRenderSizeX), static_cast<UINT>(mRenderSizeY))) {
+							evaluationColor = resized;
+						} else {
+							// No crop/zoom if shader creation fails; preserve the last working visual path.
+							fullInput = true;
+							inputWidth = mDisplaySizeX;
+							inputHeight = mDisplaySizeY;
+						}
+					}
 					static int lastFullInput = -1;
 					static unsigned int diagCount = 0;
 					if (lastFullInput != static_cast<int>(fullInput)) {
@@ -131,6 +302,11 @@ void SkyrimUpscaler::EvaluateUpscaler(ID3D11Texture2D* source)
 						diagCount = 0;
 					}
 					if (diagCount++ < 5) {
+						D3D11_TEXTURE2D_DESC actualInputDesc{};
+						evaluationColor->GetDesc(&actualInputDesc);
+						logger::info("Build16 MetalFX source: texture={}x{} declared={}x{} gpuResample={} fullInput={}",
+							actualInputDesc.Width, actualInputDesc.Height, inputWidth, inputHeight,
+							evaluationColor != mTempColor.mImage, fullInput);
 						D3D11_TEXTURE2D_DESC srcDesc{}, dstDesc{}, mvDesc{}, depthDesc{};
 						mTempColor.mImage->GetDesc(&srcDesc);
 						mTargetTex.mImage->GetDesc(&dstDesc);
@@ -157,7 +333,7 @@ void SkyrimUpscaler::EvaluateUpscaler(ID3D11Texture2D* source)
                             hasOpaque, opaqueDesc.Width, opaqueDesc.Height, static_cast<unsigned int>(opaqueDesc.Format), opaqueDesc.BindFlags,
                             static_cast<unsigned int>(depthDesc.Format), static_cast<unsigned int>(mvDesc.Format));
 					}
-					SimpleEvaluate(0, mTempColor.mImage, mMotionVectors.mImage, mDepthBuffer.mImage, transparentMask, mTargetTex.mImage, inputWidth, inputHeight, mSharpness,
+					SimpleEvaluate(0, evaluationColor, mMotionVectors.mImage, mDepthBuffer.mImage, transparentMask, mTargetTex.mImage, inputWidth, inputHeight, mSharpness,
 						mJitterOffsets[0] * j, mJitterOffsets[1] * j, mMotionScale[0], mMotionScale[1], false, g_fNear / 100, g_fFar / 100, GetVerticalFOVRad());
 					mContext->CopyResource(mMotionVectors.mImage, mMotionVectorsEmpty.mImage);
 				}
@@ -325,8 +501,13 @@ void SkyrimUpscaler::InitUpscaler()
 			SetEnabled(false);
 			return;
 		}
+		D3D11_TEXTURE2D_DESC fullColorDesc = desc;
+		fullColorDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		fullColorDesc.MiscFlags = 0;
+		fullColorDesc.CPUAccessFlags = 0;
+		fullColorDesc.Usage = D3D11_USAGE_DEFAULT;
 		if (!mTempColor.mImage &&
-			(FAILED(mDevice->CreateTexture2D(&desc, nullptr, &mTempColor.mImage)) ||
+			(FAILED(mDevice->CreateTexture2D(&fullColorDesc, nullptr, &mTempColor.mImage)) ||
 			 mTempColor.mImage == nullptr)) {
 			logger::error("Unable to create upscaler source texture");
 			SetEnabled(false);

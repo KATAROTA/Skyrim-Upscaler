@@ -148,6 +148,10 @@ void SettingGUI::OnRender()
 		}
 		ImGui::EndDisabled();
 		ImGui::TextDisabled("Diagnostic only: full input does not save GPU rendering work.");
+		ImGui::BeginDisabled(!upscaler->mUpscalerReady || upscaler->mUpscaleType != DLSS);
+		ImGui::Checkbox("MetalFX: GPU-resize source (fix zoom)", &upscaler->mUseMetalFXGpuDownsample);
+		ImGui::EndDisabled();
+		ImGui::TextDisabled("Build 16: correct 1371x886 input; no engine FPS boost yet.");
 		ImGui::Checkbox("DEBUG: record DRS viewport/scissor", &upscaler->mTraceRasterStats);
 		ImGui::TextDisabled("Read-only raster probe; logs every 120 presented frames.");
 		ImGui::BeginDisabled(!upscaler->mUpscalerReady);

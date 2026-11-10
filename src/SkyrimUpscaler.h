@@ -121,8 +121,9 @@ public:
 	int   mQualityLevel{ 0 };
 	float mMipLodBias{ 0 };
 
+	bool mUseMetalFXGpuDownsample{ true };  // Build 16: downsample full color frame on GPU before MetalFX
 	bool mForceMetalFXFullInput{ false };  // Temporary diagnostic: treat entire source texture as input content
-	bool mTraceRasterStats{ true };  // Build 14: log actual viewport / scissor regions; no rendering override
+	bool mTraceRasterStats{ false };  // Build 14: log actual viewport / scissor regions; no rendering override
 	bool mDisableEvaluation{ false };
 	bool mUseOptimalMipLodBias{ true };
 	bool mEnableTransparentMask{ false };

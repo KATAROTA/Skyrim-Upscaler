@@ -9,6 +9,7 @@ on:
       - debug-metalfx-input-region
       - probe-metalfx-drs-raster
       - probe-metalfx-render-regions-b15
+      - fix-metalfx-gpu-input-b16
   workflow_dispatch:
 
 jobs:
