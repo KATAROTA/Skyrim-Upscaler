@@ -598,7 +598,7 @@ bool SkyrimUpscaler::EvaluateBeforePostProcessing()
         mMotionScale[0], mMotionScale[1], false,
         nearPlane / 100.0f, farPlane / 100.0f, GetVerticalFOVRad());
 
-    if (!gBuild19PrePostResolve.DecodeToMain(mContext, mainColor, main.UAV))
+    if (!gBuild19PrePostResolve.DecodeToMain(mContext, mainColor, reinterpret_cast<ID3D11UnorderedAccessView*>(main.UAV)))
         return false;
     // Keep motion vectors intact through Skyrim's native image-space stage.
     static unsigned int successCount = 0;
