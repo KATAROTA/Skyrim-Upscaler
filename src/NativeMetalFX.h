@@ -15,6 +15,10 @@
 
 namespace b20 {
 using Microsoft::WRL::ComPtr;
+inline bool B23Flag(const char* key) {
+    char value[8]{};
+    return GetEnvironmentVariableA(key,value,sizeof(value))==1 && value[0]=='1';
+}
 struct TemporalDesc {
     UINT InputContentWidth, InputContentHeight;
     BOOL AutoExposure, InReset, DepthReversed, MotionVectorInDisplayRes;
@@ -207,6 +211,7 @@ struct GraphicsState {
 
 struct Buffers {
     UINT w{}, h{};
+    bool directColor=false;
     ComPtr<ID3D11Texture2D> input, motion, depth, output, resolved, fullDepth;
     ComPtr<ID3D11RenderTargetView> inputRTV, motionRTV, resolvedRTV;
     ComPtr<ID3D11DepthStencilView> depthDSV, fullDepthDSV;
@@ -248,7 +253,7 @@ struct CpuProfile {
         if(++totals.count==240) {
             const double n=totals.count;
             const double total=totals.us[0]+totals.us[1]+totals.us[2]+totals.us[3]+totals.us[4];
-            logger::info("Build22 CPU submit {}x{} sharp={} direct={}: capture={:.1f}us prepare={:.1f}us dispatch={:.1f}us resolve={:.1f}us restore={:.1f}us total={:.1f}us ({} frames)",
+            logger::info("Build23 CPU submit {}x{} sharp={} direct={}: capture={:.1f}us prepare={:.1f}us dispatch={:.1f}us resolve={:.1f}us restore={:.1f}us total={:.1f}us ({} frames)",
                 w,h,sharp,direct,totals.us[0]/n,totals.us[1]/n,totals.us[2]/n,totals.us[3]/n,totals.us[4]/n,total/n,totals.count);
             totals.count=0;totals.us.fill(0.0);
         }
@@ -261,13 +266,15 @@ class NativeMetalFX {
     ComPtr<ID3D11DeviceContext> ctx;
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> preparePS, resolvePS;
+    ComPtr<ID3D11PixelShader> prepareMotionDepthPS, resolveNoSharpPS, resolveDirectPS, resolveDirectNoSharpPS, resolveColorPS, resolveColorNoSharpPS;
     ComPtr<ID3D11RasterizerState> raster;
     ComPtr<ID3D11DepthStencilState> depthWrite;
     ComPtr<ID3D11BlendState> blend;
     ComPtr<ID3D11Buffer> constants;
     Params lastParams{};
     bool paramsValid=false;
-    Buffers b;
+    Buffers b, spare;
+    bool legacy=false, optionalShaders=false, ring=false;
     UINT outW{},outH{};
     bool resetHistory=true;
     unsigned frames=0;
@@ -313,21 +320,41 @@ Result main(float4 p:SV_Position) {
     r.depth=saturate(Depth.Load(int3(xy,0)));
     return r;
 })HLSL";
+        static constexpr char prepMotionDepth[]=R"HLSL(
+Texture2D<float2> Motion:register(t1);
+Texture2D<float> Depth:register(t2);
+struct Result {float2 motion:SV_Target0; float depth:SV_Depth;};
+Result main(float4 p:SV_Position) {
+    int2 xy=int2(p.xy); Result r;
+    float2 m=Motion.Load(int3(xy,0));
+    r.motion=all(isfinite(m)) && all(abs(m)<4.0) ? m : float2(0,0);
+    r.depth=saturate(Depth.Load(int3(xy,0)));
+    return r;
+})HLSL";
         static constexpr char resolve[]=R"HLSL(
 Texture2D<float4> Color:register(t0);
 Texture2D<float> Depth:register(t1);
 Texture2D<float4> Input:register(t2);
 cbuffer Params:register(b0){uint2 inputSize;uint2 outputSize;float sharpness;float3 pad;};
 float3 Read(int2 p){return Color.Load(int3(clamp(p,int2(0,0),int2(outputSize)-1),0)).rgb;}
-struct Result {float4 color:SV_Target0;float depth:SV_Depth;};
+struct Result {float4 color:SV_Target0;
+#ifndef B23_COLOR_ONLY
+float depth:SV_Depth;
+#endif
+};
 Result main(float4 p:SV_Position) {
     int2 xy=int2(p.xy); float3 c=Read(xy);
     int2 z=min(int2(p.xy*float2(inputSize)/float2(outputSize)),int2(inputSize)-1);
-    // Guard the first frame against invalid/empty output without presenting a black frame.
+    // A direct-color steady frame has no separate source color copy.
+#ifdef B23_NO_FALLBACK
+    if(!all(isfinite(c))) c=float3(0,0,0);
+#else
     if(!all(isfinite(c)) || all(abs(c)<0.00001)) {
         float3 fallback=Input.Load(int3(z,0)).rgb;
         if(!all(isfinite(c)) || any(fallback>0.001)) c=fallback;
     }
+#endif
+#ifndef B23_NO_SHARP
     if(sharpness>0.001){
         float3 a=Read(xy+int2(1,0)),b=Read(xy-int2(1,0));
         float3 d=Read(xy+int2(0,1)),e=Read(xy-int2(0,1));
@@ -335,22 +362,41 @@ Result main(float4 p:SV_Position) {
         float3 sharpened=clamp(c+sharpness*(c-(a+b+d+e)*0.25),lo,hi);
         if(all(isfinite(sharpened)))c=sharpened;
     }
+#endif
     Result r;r.color=float4(max(c,0.0),1.0);
-    r.depth=Depth.Load(int3(z,0));return r;
+#ifndef B23_COLOR_ONLY
+    r.depth=Depth.Load(int3(z,0));
+#endif
+    return r;
 })HLSL";
-        auto build=[&](const char* source,const char* target,ComPtr<ID3DBlob>& code) {
+        auto build=[&](const char* source,const char* target,ComPtr<ID3DBlob>& code,const D3D_SHADER_MACRO* macros=nullptr) {
             ComPtr<ID3DBlob> err;
-            auto hr=compile(source,std::strlen(source),"Build20",nullptr,nullptr,"main",target,D3DCOMPILE_OPTIMIZATION_LEVEL3,0,code.ReleaseAndGetAddressOf(),err.GetAddressOf());
+            auto hr=compile(source,std::strlen(source),"Build23",macros,nullptr,"main",target,D3DCOMPILE_OPTIMIZATION_LEVEL3,0,code.ReleaseAndGetAddressOf(),err.GetAddressOf());
             if(FAILED(hr)&&err) logger::error("Build20 HLSL {}: {}",target,std::string(static_cast<const char*>(err->GetBufferPointer()),err->GetBufferSize()));
             return Check(hr,"D3DCompile");
         };
         ComPtr<ID3DBlob> v,p,r;
         bool ok=build(vertex,"vs_5_0",v)&&build(prep,"ps_5_0",p)&&build(resolve,"ps_5_0",r);
-        FreeLibrary(compiler);
-        if(!ok)return false;
-        return Check(dev->CreateVertexShader(v->GetBufferPointer(),v->GetBufferSize(),nullptr,vs.GetAddressOf()),"CreateVertexShader") &&
+        if(!ok){FreeLibrary(compiler);return false;}
+        ok=Check(dev->CreateVertexShader(v->GetBufferPointer(),v->GetBufferSize(),nullptr,vs.GetAddressOf()),"CreateVertexShader") &&
             Check(dev->CreatePixelShader(p->GetBufferPointer(),p->GetBufferSize(),nullptr,preparePS.GetAddressOf()),"Create preparePS") &&
             Check(dev->CreatePixelShader(r->GetBufferPointer(),r->GetBufferSize(),nullptr,resolvePS.GetAddressOf()),"Create resolvePS");
+        auto pixel=[&](const char* source,ComPtr<ID3D11PixelShader>& shader,const D3D_SHADER_MACRO* macros=nullptr) {
+            ComPtr<ID3DBlob> code;
+            return build(source,"ps_5_0",code,macros) && Check(dev->CreatePixelShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,shader.GetAddressOf()),"Build23 optional pixel shader");
+        };
+        const D3D_SHADER_MACRO noSharp[]={{"B23_NO_SHARP","1"},{nullptr,nullptr}};
+        const D3D_SHADER_MACRO noFallback[]={{"B23_NO_FALLBACK","1"},{nullptr,nullptr}};
+        const D3D_SHADER_MACRO directNoSharp[]={{"B23_NO_FALLBACK","1"},{"B23_NO_SHARP","1"},{nullptr,nullptr}};
+        const D3D_SHADER_MACRO colorOnly[]={{"B23_COLOR_ONLY","1"},{nullptr,nullptr}};
+        const D3D_SHADER_MACRO colorNoSharp[]={{"B23_COLOR_ONLY","1"},{"B23_NO_SHARP","1"},{nullptr,nullptr}};
+        optionalShaders=ok && !legacy && pixel(prepMotionDepth,prepareMotionDepthPS) &&
+            pixel(resolve,resolveNoSharpPS,noSharp) && pixel(resolve,resolveDirectPS,noFallback) &&
+            pixel(resolve,resolveDirectNoSharpPS,directNoSharp) && pixel(resolve,resolveColorPS,colorOnly) &&
+            pixel(resolve,resolveColorNoSharpPS,colorNoSharp);
+        FreeLibrary(compiler);
+        logger::info("Build23 shader variants ready={} legacy={}",optionalShaders,legacy);
+        return ok;
     }
     void View(UINT w,UINT h) {
         D3D11_VIEWPORT v{0,0,static_cast<float>(w),static_cast<float>(h),0,1};
@@ -363,6 +409,8 @@ public:
     bool Init(ID3D11Device* device,ID3D11DeviceContext* context,UINT w,UINT h) {
         if(!device||!context||!w||!h)return false;
         dev=device;ctx=context;outW=w;outH=h;paramsValid=false;
+        legacy=B23Flag("ANDZEN_B23_LEGACY");
+        logger::info("Build23 init {}x{} legacy={} directColorProbe={} ringDisabled={}",w,h,legacy,B23Flag("ANDZEN_B23_DIRECT_COLOR"),B23Flag("ANDZEN_B23_NO_RING"));
         if(!Check(ctx->QueryInterface(__uuidof(ContextExt1),reinterpret_cast<void**>(ext.GetAddressOf())),"DXMT context interface"))return false;
         BOOL supported=FALSE;
         if(!Check(ext->CheckFeatureSupport(0,&supported,sizeof(supported)),"MetalFX feature support")||!supported)return false;
@@ -378,13 +426,14 @@ public:
             Check(dev->CreateBlendState(&bd,blend.GetAddressOf()),"CreateBlendState")&&
             Check(dev->CreateBuffer(&cb,nullptr,constants.GetAddressOf()),"Create constant buffer");
     }
-    bool Configure(UINT w,UINT h) {
-        if(!ext||!dev||!vs||!w||!h||w>outW||h>outH)return false;
-        if(b.input && b.w==w && b.h==h) { resetHistory=true;return true; }
-        Buffers n;n.w=w;n.h=h;
-        if(!Texture(w,h,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE,n.input)||
-           !Texture(w,h,DXGI_FORMAT_R16G16_FLOAT,D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE,n.motion)||
-           !Texture(w,h,DXGI_FORMAT_R32_TYPELESS,D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE,n.depth)||
+    bool MakeBuffers(UINT w,UINT h,bool directColor,Buffers& n) {
+        n.w=w;n.h=h;n.directColor=directColor;
+        const UINT pw=directColor?outW:w, ph=directColor?outH:h;
+        // Direct color uses the engine texture as MetalFX input. The small R11 texture
+        // is a reset-frame fallback only; motion and depth retain sanitization.
+        if(!Texture(w,h,directColor?DXGI_FORMAT_R11G11B10_FLOAT:DXGI_FORMAT_R16G16B16A16_FLOAT,D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE,n.input)||
+           !Texture(pw,ph,DXGI_FORMAT_R16G16_FLOAT,D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE,n.motion)||
+           !Texture(pw,ph,DXGI_FORMAT_R32_TYPELESS,D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE,n.depth)||
            !Texture(outW,outH,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS,n.output)||
            !Texture(outW,outH,DXGI_FORMAT_R11G11B10_FLOAT,D3D11_BIND_RENDER_TARGET,n.resolved)||
            !Texture(outW,outH,DXGI_FORMAT_R24G8_TYPELESS,D3D11_BIND_DEPTH_STENCIL,n.fullDepth))return false;
@@ -397,8 +446,33 @@ public:
         // Require a real UAV on the MetalFX destination; the engine's kMAIN does not need one.
         if(!Check(dev->CreateUnorderedAccessView(n.output.Get(),nullptr,n.outputUAV.GetAddressOf()),"output UAV")||
            !Check(dev->CreateShaderResourceView(n.input.Get(),nullptr,n.inputSRV.GetAddressOf()),"input SRV"))return false;
-        b=std::move(n);resetHistory=true;frames=0;
-        logger::info("Build20 native buffers READY: color FP16, motion RG16F, depth D32, {}x{} -> {}x{}",w,h,outW,outH);
+        if(directColor) {
+            const FLOAT zero[4]{};
+            ctx->ClearRenderTargetView(n.motionRTV.Get(),zero);
+            ctx->ClearDepthStencilView(n.depthDSV.Get(),D3D11_CLEAR_DEPTH,1.0f,0);
+        }
+        return true;
+    }
+    bool Configure(UINT w,UINT h) {
+        if(!ext||!dev||!vs||!w||!h||w>outW||h>outH)return false;
+        if(b.input && b.w==w && b.h==h) {resetHistory=true;return true;}
+        Source source;
+        const bool wantDirect=optionalShaders && outW==1920 && outH==1200 && w<outW && h<outH &&
+            B23Flag("ANDZEN_B23_DIRECT_COLOR") && GetSource(source,outW,outH) && source.directCapable &&
+            (source.colorDesc.BindFlags & (D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE)) == (D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE);
+        bool useDirect=wantDirect;
+        Buffers n;
+        if(!MakeBuffers(w,h,useDirect,n)) {
+            if(!useDirect)return false;
+            logger::warn("Build23 direct-color allocation failed; using compatible input");
+            n=Buffers{};useDirect=false;
+            if(!MakeBuffers(w,h,false,n))return false;
+        }
+        Buffers next;
+        ring=optionalShaders && !B23Flag("ANDZEN_B23_NO_RING") && MakeBuffers(w,h,useDirect,next);
+        if(!ring)next=Buffers{};
+        b=std::move(n);spare=std::move(next);resetHistory=true;frames=0;
+        logger::info("Build23 buffers READY: {}x{} -> {}x{} directColor={} requested={} ring={} optimizedShaders={}",w,h,outW,outH,useDirect,wantDirect,ring,optionalShaders);
         return true;
     }
     void Reset(){resetHistory=true;}
@@ -409,7 +483,17 @@ public:
         ctx->OMGetRenderTargetsAndUnorderedAccessViews(0,nullptr,nullptr,0,8,uavs);
         bool occupied=false;for(auto* v:uavs)if(v){occupied=true;v->Release();}
         if(occupied){logger::error("Build20 prepost has active OM UAV; aborting native pass");return false;}
-        const bool direct=(b.w!=outW||b.h!=outH)&&s.directCapable;
+        if(b.directColor && !s.directCapable) {
+            logger::warn("Build23 direct source changed; rebuilding compatible buffers");
+            Buffers n;
+            if(!MakeBuffers(b.w,b.h,false,n))return false;
+            b=std::move(n);spare=Buffers{};ring=false;resetHistory=true;frames=0;
+        }
+        const bool nativeSize=b.w==outW && b.h==outH;
+        const bool direct=s.directCapable && (!nativeSize || optionalShaders);
+        const bool colorOnly=direct && nativeSize && optionalShaders;
+        const bool directColor=b.directColor;
+        const bool noSharp=sharp<=0.001f;
         CpuProfile profile(b.w,b.h,sharp,direct);
         ResolveAliases aliases(ctx.Get(),s,direct);
         GraphicsState guard(ctx.Get());
@@ -428,15 +512,27 @@ public:
         ctx->RSSetState(raster.Get());ctx->OMSetBlendState(blend.Get(),nullptr,0xffffffffu);ctx->OMSetDepthStencilState(depthWrite.Get(),0);
         // First pass copies only the genuinely rendered DRS rectangle; no bilinear downsampling.
         View(b.w,b.h);
-        ID3D11RenderTargetView* rt[]{b.inputRTV.Get(),b.motionRTV.Get()};
-        ctx->OMSetRenderTargets(2,rt,b.depthDSV.Get());
-        ID3D11ShaderResourceView* src[]{s.colorSRV,s.motionSRV,s.depthSRV};
-        ctx->PSSetShaderResources(0,3,src);ctx->PSSetShader(preparePS.Get(),nullptr,0);ctx->Draw(3,0);
+        if(directColor) {
+            // Preserve the known Build22 fallback on the history-reset frame.
+            if(resetHistory) {
+                D3D11_BOX box{0,0,0,b.w,b.h,1};
+                ctx->CopySubresourceRegion(b.input.Get(),0,0,0,0,s.color,0,&box);
+            }
+            auto* rt=b.motionRTV.Get();
+            ctx->OMSetRenderTargets(1,&rt,b.depthDSV.Get());
+            ID3D11ShaderResourceView* src[]{nullptr,s.motionSRV,s.depthSRV};
+            ctx->PSSetShaderResources(0,3,src);ctx->PSSetShader(prepareMotionDepthPS.Get(),nullptr,0);ctx->Draw(3,0);
+        } else {
+            ID3D11RenderTargetView* rt[]{b.inputRTV.Get(),b.motionRTV.Get()};
+            ctx->OMSetRenderTargets(2,rt,b.depthDSV.Get());
+            ID3D11ShaderResourceView* src[]{s.colorSRV,s.motionSRV,s.depthSRV};
+            ctx->PSSetShaderResources(0,3,src);ctx->PSSetShader(preparePS.Get(),nullptr,0);ctx->Draw(3,0);
+        }
         ClearBindings();
         profile.Mark();
         TemporalDesc d{};d.InputContentWidth=b.w;d.InputContentHeight=b.h;
         d.AutoExposure=TRUE;d.InReset=resetHistory?TRUE:FALSE;d.DepthReversed=FALSE;d.MotionVectorInDisplayRes=FALSE;
-        d.Color=b.input.Get();d.Depth=b.depth.Get();d.MotionVector=b.motion.Get();d.Output=b.output.Get();
+        d.Color=directColor?s.color:b.input.Get();d.Depth=b.depth.Get();d.MotionVector=b.motion.Get();d.Output=b.output.Get();
         d.MotionVectorScaleX=static_cast<float>(b.w);d.MotionVectorScaleY=static_cast<float>(b.h);d.PreExposure=1.0f;
         d.JitterOffsetX=jx;d.JitterOffsetY=jy;
         if(resetHistory){const FLOAT zero[4]{};ctx->ClearUnorderedAccessViewFloat(b.outputUAV.Get(),zero);}
@@ -450,17 +546,26 @@ public:
         else ctx->CopyResource(b.fullDepth.Get(),s.depth);
         View(outW,outH);
         auto* out=direct?s.colorRTV:b.resolvedRTV.Get();
-        ctx->OMSetRenderTargets(1,&out,direct?s.depthDSV:b.fullDepthDSV.Get());
-        ID3D11ShaderResourceView* resolveSrc[]{b.outputSRV.Get(),b.depthSRV.Get(),b.inputSRV.Get()};
+        ctx->OMSetRenderTargets(1,&out,colorOnly?nullptr:(direct?s.depthDSV:b.fullDepthDSV.Get()));
+        const bool directSteady=directColor&&!resetHistory;
+        ID3D11ShaderResourceView* resolveSrc[]{b.outputSRV.Get(),colorOnly?nullptr:b.depthSRV.Get(),directSteady?nullptr:b.inputSRV.Get()};
         ctx->PSSetShaderResources(0,3,resolveSrc);
         auto* cb=constants.Get();ctx->PSSetConstantBuffers(0,1,&cb);
-        ctx->PSSetShader(resolvePS.Get(),nullptr,0);ctx->Draw(3,0);ClearBindings();
+        ID3D11PixelShader* shader=resolvePS.Get();
+        if(optionalShaders) {
+            if(colorOnly)shader=noSharp?resolveColorNoSharpPS.Get():resolveColorPS.Get();
+            else if(directSteady)shader=noSharp?resolveDirectNoSharpPS.Get():resolveDirectPS.Get();
+            else if(noSharp)shader=resolveNoSharpPS.Get();
+        }
+        ctx->PSSetShader(shader,nullptr,0);ctx->Draw(3,0);ClearBindings();
         if(!direct) {
             ctx->CopyResource(s.color,b.resolved.Get());ctx->CopyResource(s.depth,b.fullDepth.Get());
         }
         profile.Mark();
-        if(frames++<3||resetHistory)logger::info("Build22 native MetalFX SUBMITTED: {}x{} -> {}x{}, reset={}, sharpness={}, directResolve={}",b.w,b.h,outW,outH,resetHistory,sharp,direct);
-        resetHistory=false;return true;
+        if(frames++<3||resetHistory)logger::info("Build23 native MetalFX SUBMITTED: {}x{} -> {}x{}, reset={}, sharpness={}, directResolve={}, directColor={}, colorOnly={}, ring={}",b.w,b.h,outW,outH,resetHistory,sharp,direct,directColor,colorOnly,ring);
+        resetHistory=false;
+        if(ring)std::swap(b,spare);
+        return true;
     }
 };
 inline NativeMetalFX native;

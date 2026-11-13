@@ -12,6 +12,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
+#include <array>
+#include <chrono>
 #include <RE/S/State.h>
 #include <RE/R/Renderer.h>
 
@@ -46,10 +49,46 @@ void WINAPI hk_ID3D11DeviceContext_RSSetViewports(ID3D11DeviceContext* This, UIN
 
 HRESULT WINAPI hk_IDXGISwapChain_Present(IDXGISwapChain* This, UINT SyncInterval, UINT Flags)
 {
+    using Clock=std::chrono::steady_clock;
+    const auto begin=Clock::now();
     SettingGUI::GetSingleton()->OnRender();
+    const auto presentBegin=Clock::now();
     auto hr=(This->*ptrPresent)(SyncInterval,Flags);
+    const auto end=Clock::now();
+    auto* u=SkyrimUpscaler::GetSingleton();
+    // Per-thread rolling presentation intervals; no GPU waits or query readbacks.
+    struct FrameStats {
+        Clock::time_point previous{};
+        bool active=false;
+        int w=0,h=0;
+        unsigned n=0;
+        double total=0,present=0,overlay=0;
+        std::array<double,240> ms{};
+    };
+    thread_local FrameStats stats;
+    const bool active=u->mBuild19EarlyAppliedThisFrame;
+    const int w=active?u->mRenderSizeX:u->mDisplaySizeX;
+    const int h=active?u->mRenderSizeY:u->mDisplaySizeY;
+    if(SUCCEEDED(hr) && !(Flags & DXGI_PRESENT_TEST) && w>0 && h>0) {
+        if(stats.previous==Clock::time_point{} || stats.active!=active || stats.w!=w || stats.h!=h) {
+            stats=FrameStats{};stats.active=active;stats.w=w;stats.h=h;
+        } else {
+            const double dt=std::chrono::duration<double,std::milli>(end-stats.previous).count();
+            if(dt>0 && dt<2000) {
+                stats.ms[stats.n++]=dt;stats.total+=dt;
+                stats.present+=std::chrono::duration<double,std::milli>(end-presentBegin).count();
+                stats.overlay+=std::chrono::duration<double,std::milli>(presentBegin-begin).count();
+                if(stats.n==stats.ms.size()) {
+                    std::sort(stats.ms.begin(),stats.ms.end());
+                    logger::info("Build23 frame stats active={} render={}x{} n={} avgFPS={:.2f} mean={:.2f}ms p95={:.2f}ms max={:.2f}ms presentCPU={:.2f}ms overlayCPU={:.3f}ms sync={}",active,w,h,stats.n,1000.0*stats.n/stats.total,stats.total/stats.n,stats.ms[227],stats.ms.back(),stats.present/stats.n,stats.overlay/stats.n,SyncInterval);
+                    stats.n=0;stats.total=stats.present=stats.overlay=0;
+                }
+            } else {stats.n=0;stats.total=stats.present=stats.overlay=0;}
+        }
+        stats.previous=end;
+    }
     DRS::GetSingleton()->Update();
-    SkyrimUpscaler::GetSingleton()->mBuild19EarlyAppliedThisFrame=false;
+    u->mBuild19EarlyAppliedThisFrame=false;
     return hr;
 }
 

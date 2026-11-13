@@ -119,15 +119,15 @@ void SettingGUI::OnRender()
         ImGui::EndDisabled();
         ImGui::EndDisabled();
         ImGui::Separator();
-        ImGui::Text("Render: %d x %d",u->mRenderSizeX,u->mRenderSizeY);
+        ImGui::Text("Render: %d x %d",u->IsEnabled()?u->mRenderSizeX:u->mDisplaySizeX,u->IsEnabled()?u->mRenderSizeY:u->mDisplaySizeY);
         ImGui::Text("Output: %d x %d",u->mDisplaySizeX,u->mDisplaySizeY);
-        ImGui::TextUnformatted("Build 22 | DXMT native temporal scaler");
+        ImGui::TextUnformatted("Build 23 | DXMT native temporal scaler");
         ImGui::End();
     }
 
 	// Rendering
 	ImGui::Render();
-	ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+	if(auto* data=ImGui::GetDrawData(); data && data->TotalVtxCount>0) ImGui_ImplDX11_RenderDrawData(data);
 }
 
 void SettingGUI::OnCleanup()

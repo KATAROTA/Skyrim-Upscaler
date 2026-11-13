@@ -16,6 +16,7 @@ on:
       - metalfx-native-b20
       - metalfx-native-b21
       - metalfx-native-b22
+      - metalfx-native-b23
   workflow_dispatch:
 
 jobs:
