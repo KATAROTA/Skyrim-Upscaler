@@ -74,7 +74,7 @@ void DRS::SetDRS(BSGraphics::State* a_state)
     static bool wasActive=false;
     static std::int32_t savedLock=0;
     if(active&&!wasActive)savedLock=r.dynamicResolutionLock;
-    if(active)r.dynamicResolutionLock=1;
+    if(active)r.dynamicResolutionLock=(u->mUpscaleType==DLSS)?0:1;
     else if(wasActive)r.dynamicResolutionLock=savedLock;
     r.dynamicResolutionPreviousWidthRatio=previousX;
     r.dynamicResolutionPreviousHeightRatio=previousY;

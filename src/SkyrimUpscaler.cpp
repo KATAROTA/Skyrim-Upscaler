@@ -181,8 +181,10 @@ bool SkyrimUpscaler::EvaluateBeforePostProcessing()
     } else { mNativeFailed=true;mUpscalerReady=false;SetEnabled(false);return false; }
     if (mUpscaleType==DLSS && !mNativeViewportSeen.load(std::memory_order_relaxed)) {
         if (++mNativeViewportWait < 12) return false;
-        logger::error("Build20 no reduced world viewport observed; refusing to crop a native-size frame");
-        mNativeFailed=true;mUpscalerReady=false;SetEnabled(false);return false;
+        logger::error("Build20 DRS fix: no reduced world viewport observed");
+        SetEnabled(false);
+        DRS::GetSingleton()->SetDRS(reinterpret_cast<BSGraphics::State*>(state));
+        return false;
     }
     if (valid && b20::native.Evaluate(s, mJitterOffsets[0], mJitterOffsets[1], mSharpening ? mSharpness : 0.0f)) {
         mNativeHistoryReset = false;

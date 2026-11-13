@@ -24,6 +24,13 @@ void WINAPI hk_ID3D11DeviceContext_RSSetViewports(ID3D11DeviceContext* This, UIN
     if(v && count && u->mUpscalerReady && u->mEnableUpscaler && u->mUpscaleType==DLSS &&
         !u->mNativeViewportSeen.load(std::memory_order_relaxed)) {
         for(UINT i=0;i<count;++i) {
+            static unsigned samples=0;
+            if(samples<24) {
+                ++samples;
+                auto* state=RE::BSGraphics::State::GetSingleton();
+                const int lock=state?state->GetRuntimeData().dynamicResolutionLock:-1;
+                logger::info("Build20 DRS fix viewport: {}x{} origin=({}, {}) lock={}",v[i].Width,v[i].Height,v[i].TopLeftX,v[i].TopLeftY,lock);
+            }
             if(std::fabs(v[i].Width-float(u->mRenderSizeX))<=2.0f &&
                std::fabs(v[i].Height-float(u->mRenderSizeY))<=2.0f &&
                std::fabs(v[i].TopLeftX)<1.0f && std::fabs(v[i].TopLeftY)<1.0f) {
