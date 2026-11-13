@@ -12,299 +12,37 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <RE/S/State.h>
 
-static float                                                        mipLodBias = 0;
-static std::unordered_set<ID3D11SamplerState*>                      passThroughSamplers;
-static std::unordered_map<ID3D11SamplerState*, ID3D11SamplerState*> mappedSamplers;
-static std::map<int, ID3D11Texture2D*>                              targetMap;
-static int                                                          size;
-static std::map<int, ID3D11Texture2D*>                              targetMap2;
-static int                                                          size2;
-static int                                                          index;
-
-decltype(&D3D11CreateDeviceAndSwapChain)      ptrD3D11CreateDeviceAndSwapChain;
-decltype(&IDXGISwapChain::Present)            ptrPresent;
-decltype(&ID3D11Device::CreateTexture2D)      ptrCreateTexture2D;
-decltype(&ID3D11DeviceContext::PSSetSamplers) ptrPSSetSamplers;
-decltype(&ID3D11DeviceContext::VSSetSamplers) ptrVSSetSamplers;
-decltype(&ID3D11DeviceContext::GSSetSamplers) ptrGSSetSamplers;
-decltype(&ID3D11DeviceContext::HSSetSamplers) ptrHSSetSamplers;
-decltype(&ID3D11DeviceContext::DSSetSamplers) ptrDSSetSamplers;
-decltype(&ID3D11DeviceContext::CSSetSamplers) ptrCSSetSamplers;
+decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChain;
+decltype(&IDXGISwapChain::Present) ptrPresent;
 decltype(&ID3D11DeviceContext::RSSetViewports) ptrRSSetViewports;
-decltype(&ID3D11DeviceContext::RSSetScissorRects) ptrRSSetScissorRects;
 
-// Instrumentation only: original D3D11 calls are always forwarded unchanged.
-struct Build14RasterCounters
+void WINAPI hk_ID3D11DeviceContext_RSSetViewports(ID3D11DeviceContext* This, UINT count, const D3D11_VIEWPORT* v)
 {
-    std::atomic<unsigned int> vpFull{ 0 }, vpInternal{ 0 }, vpOther{ 0 };
-    std::atomic<unsigned int> vpNearInternal{ 0 }, vpReducedAspect{ 0 };
-    std::atomic<unsigned int> vpReducedLastWidth{ 0 }, vpReducedLastHeight{ 0 };
-    std::atomic<unsigned int> scFull{ 0 }, scInternal{ 0 }, scOther{ 0 };
-    std::atomic<unsigned int> vpLastWidth{ 0 }, vpLastHeight{ 0 };
-    std::atomic<unsigned int> scLastWidth{ 0 }, scLastHeight{ 0 };
-};
-static Build14RasterCounters gRasterCounters;
-
-static bool Build14DimensionsMatch(float width, float height, int wantedWidth, int wantedHeight)
-{
-    return wantedWidth > 0 && wantedHeight > 0 &&
-        std::fabs(width - static_cast<float>(wantedWidth)) <= 2.0f &&
-        std::fabs(height - static_cast<float>(wantedHeight)) <= 2.0f;
-}
-
-void WINAPI hk_ID3D11DeviceContext_RSSetViewports(ID3D11DeviceContext* This, UINT NumViewports, const D3D11_VIEWPORT* pViewports)
-{
-    const auto* u = SkyrimUpscaler::GetSingleton();
-    if (u->mTraceRasterStats && NumViewports > 0 && pViewports &&
-        u->mDisplaySizeX > 0 && u->mRenderSizeX > 0) {
-        const auto& vp = pViewports[0];
-        gRasterCounters.vpLastWidth.store(static_cast<unsigned int>(vp.Width), std::memory_order_relaxed);
-        gRasterCounters.vpLastHeight.store(static_cast<unsigned int>(vp.Height), std::memory_order_relaxed);
-        if (Build14DimensionsMatch(vp.Width, vp.Height, u->mRenderSizeX, u->mRenderSizeY) &&
-            !Build14DimensionsMatch(vp.Width, vp.Height, u->mDisplaySizeX, u->mDisplaySizeY))
-            gRasterCounters.vpInternal.fetch_add(1, std::memory_order_relaxed);
-        else if (Build14DimensionsMatch(vp.Width, vp.Height, u->mDisplaySizeX, u->mDisplaySizeY))
-            gRasterCounters.vpFull.fetch_add(1, std::memory_order_relaxed);
-        else {
-            gRasterCounters.vpOther.fetch_add(1, std::memory_order_relaxed);
-            // Account for reductions rounded to GPU-friendly dimensions.
-            const float desiredW = static_cast<float>(u->mRenderSizeX);
-            const float desiredH = static_cast<float>(u->mRenderSizeY);
-            if (std::fabs(vp.Width - desiredW) <= 32.0f &&
-                std::fabs(vp.Height - desiredH) <= 32.0f) {
-                gRasterCounters.vpNearInternal.fetch_add(1, std::memory_order_relaxed);
-            }
-            const float fullW = static_cast<float>(u->mDisplaySizeX);
-            const float fullH = static_cast<float>(u->mDisplaySizeY);
-            if (vp.Width >= fullW * 0.45f && vp.Width < fullW - 16.0f &&
-                vp.Height >= fullH * 0.45f && vp.Height < fullH - 16.0f &&
-                vp.Height > 0.0f &&
-                std::fabs(vp.Width / vp.Height - fullW / fullH) < 0.035f) {
-                gRasterCounters.vpReducedAspect.fetch_add(1, std::memory_order_relaxed);
-                gRasterCounters.vpReducedLastWidth.store(static_cast<unsigned int>(vp.Width), std::memory_order_relaxed);
-                gRasterCounters.vpReducedLastHeight.store(static_cast<unsigned int>(vp.Height), std::memory_order_relaxed);
+    auto* u=SkyrimUpscaler::GetSingleton();
+    if(v && count && u->mUpscalerReady && u->mEnableUpscaler && u->mUpscaleType==DLSS &&
+        !u->mNativeViewportSeen.load(std::memory_order_relaxed)) {
+        for(UINT i=0;i<count;++i) {
+            if(std::fabs(v[i].Width-float(u->mRenderSizeX))<=2.0f &&
+               std::fabs(v[i].Height-float(u->mRenderSizeY))<=2.0f &&
+               std::fabs(v[i].TopLeftX)<1.0f && std::fabs(v[i].TopLeftY)<1.0f) {
+                u->mNativeViewportSeen.store(true,std::memory_order_relaxed);
+                logger::info("Build20 reduced raster verified: {}x{}",v[i].Width,v[i].Height);
+                break;
             }
         }
     }
-    (This->*ptrRSSetViewports)(NumViewports, pViewports);
+    (This->*ptrRSSetViewports)(count,v);
 }
-
-void WINAPI hk_ID3D11DeviceContext_RSSetScissorRects(ID3D11DeviceContext* This, UINT NumRects, const D3D11_RECT* pRects)
-{
-    const auto* u = SkyrimUpscaler::GetSingleton();
-    if (u->mTraceRasterStats && NumRects > 0 && pRects &&
-        u->mDisplaySizeX > 0 && u->mRenderSizeX > 0) {
-        const auto& rect = pRects[0];
-        const float width = static_cast<float>(rect.right - rect.left);
-        const float height = static_cast<float>(rect.bottom - rect.top);
-        gRasterCounters.scLastWidth.store(width > 0 ? static_cast<unsigned int>(width) : 0u, std::memory_order_relaxed);
-        gRasterCounters.scLastHeight.store(height > 0 ? static_cast<unsigned int>(height) : 0u, std::memory_order_relaxed);
-        if (Build14DimensionsMatch(width, height, u->mRenderSizeX, u->mRenderSizeY) &&
-            !Build14DimensionsMatch(width, height, u->mDisplaySizeX, u->mDisplaySizeY))
-            gRasterCounters.scInternal.fetch_add(1, std::memory_order_relaxed);
-        else if (Build14DimensionsMatch(width, height, u->mDisplaySizeX, u->mDisplaySizeY))
-            gRasterCounters.scFull.fetch_add(1, std::memory_order_relaxed);
-        else
-            gRasterCounters.scOther.fetch_add(1, std::memory_order_relaxed);
-    }
-    (This->*ptrRSSetScissorRects)(NumRects, pRects);
-}
-
-
-static void MyLog(char* message, int size)
-{
-	logger::info("{}", message);
-}
-
 
 HRESULT WINAPI hk_IDXGISwapChain_Present(IDXGISwapChain* This, UINT SyncInterval, UINT Flags)
 {
-	SettingGUI::GetSingleton()->OnRender();
-	auto hr = (This->*ptrPresent)(SyncInterval, Flags);
-	DRS::GetSingleton()->Update();
-    static unsigned int presentedFrames = 0;
-    if (++presentedFrames % 120 == 0) {
-        auto* u = SkyrimUpscaler::GetSingleton();
-        if (u->mTraceRasterStats && u->mUpscalerReady) {
-            logger::info("Build15 raster: DRS={} desired={}x{} output={}x{} | viewport full={} internal={} near32={} reducedAspect={} sampleReduced={}x{} other={} last={}x{} | scissor full={} internal={} other={} last={}x{}",
-                DRS::GetSingleton()->currentScaleFactor,
-                u->mRenderSizeX, u->mRenderSizeY, u->mDisplaySizeX, u->mDisplaySizeY,
-                gRasterCounters.vpFull.exchange(0), gRasterCounters.vpInternal.exchange(0),
-                gRasterCounters.vpNearInternal.exchange(0), gRasterCounters.vpReducedAspect.exchange(0),
-                gRasterCounters.vpReducedLastWidth.load(), gRasterCounters.vpReducedLastHeight.load(),
-                gRasterCounters.vpOther.exchange(0),
-                gRasterCounters.vpLastWidth.load(), gRasterCounters.vpLastHeight.load(),
-                gRasterCounters.scFull.exchange(0), gRasterCounters.scInternal.exchange(0), gRasterCounters.scOther.exchange(0),
-                gRasterCounters.scLastWidth.load(), gRasterCounters.scLastHeight.load());
-        }
-    }
-	return hr;
-}
-
-HRESULT WINAPI hk_ID3D11Device_CreateTexture2D(ID3D11Device* This, const D3D11_TEXTURE2D_DESC* pDesc, const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D)
-{
-	auto hr = (This->*ptrCreateTexture2D)(pDesc, pInitialData, ppTexture2D);
-	if (FAILED(hr)) {
-		// Log only the first few failures to avoid flooding the rendering thread.
-		static std::atomic<unsigned int> failureCount{ 0 };
-		if (failureCount.fetch_add(1, std::memory_order_relaxed) < 12) {
-			if (pDesc) {
-				logger::error("CreateTexture2D failed: HRESULT=0x{:08X}, {}x{}, Format={}, Usage={}, Bind=0x{:X}, Misc=0x{:X}, Mips={}, Array={}, Samples={}",
-					static_cast<unsigned int>(hr), pDesc->Width, pDesc->Height,
-					static_cast<unsigned int>(pDesc->Format), static_cast<unsigned int>(pDesc->Usage),
-					pDesc->BindFlags, pDesc->MiscFlags, pDesc->MipLevels,
-					pDesc->ArraySize, pDesc->SampleDesc.Count);
-			} else {
-				logger::error("CreateTexture2D failed: HRESULT=0x{:08X}, descriptor=null", static_cast<unsigned int>(hr));
-			}
-		}
-	}
-	if (FAILED(hr) || pDesc == nullptr || ppTexture2D == nullptr || *ppTexture2D == nullptr)
-		return hr;
-	static bool locking = false;
-	if (locking)
-		return hr;
-	if (pDesc->Format == DXGI_FORMAT_R16G16_FLOAT && pDesc->BindFlags == (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET)) {
-		if (SkyrimUpscaler::GetSingleton()->mDisplaySizeX > 0) {
-			if (pDesc->Width != SkyrimUpscaler::GetSingleton()->mDisplaySizeX ||
-				pDesc->Height != SkyrimUpscaler::GetSingleton()->mDisplaySizeY)
-				return hr;
-		}
-		if (SettingGUI::GetSingleton()->sorted_item_list.size() > 0 && !REL::Module::IsVR())
-			return hr;
-		motion_item item = { 1u, *ppTexture2D, *pDesc };
-		SettingGUI::GetSingleton()->sorted_item_list.push_back(item);
-		SettingGUI::GetSingleton()->selected_item = item;
-		locking = true;
-		SkyrimUpscaler::GetSingleton()->SetupMotionVector(SettingGUI::GetSingleton()->selected_item.resource);
-		locking = false;
-		//SkyrimUpscaler::GetSingleton()->InitUpscaler();
-		logger::info("Motion Vertor Found : {} x {}", pDesc->Width, pDesc->Height);
-	} else if (pDesc->Format >= DXGI_FORMAT_R24G8_TYPELESS && pDesc->Format <= DXGI_FORMAT_X24_TYPELESS_G8_UINT) {
-		if (pDesc->Width == SkyrimUpscaler::GetSingleton()->mDisplaySizeX &&
-			pDesc->Height == SkyrimUpscaler::GetSingleton()->mDisplaySizeY &&
-			pDesc->BindFlags & D3D11_BIND_DEPTH_STENCIL) {
-			logger::info("Depth Buffer Found : {} x {}", pDesc->Width, pDesc->Height);
-			static int VRSkip = REL::Module::IsVR() ? 3 : 0;
-			if (VRSkip > 0) {
-				VRSkip--;
-				return hr;
-			}
-			if (SkyrimUpscaler::GetSingleton()->mDepthBuffer.mImage != nullptr)
-				return hr;
-			locking = true;
-			SkyrimUpscaler::GetSingleton()->SetupDepth(*ppTexture2D);
-			locking = false;
-		}
-	} else if (pDesc->Format == DXGI_FORMAT_R8G8_UNORM) {
-		if (pDesc->Width == SkyrimUpscaler::GetSingleton()->mDisplaySizeX &&
-			pDesc->Height == SkyrimUpscaler::GetSingleton()->mDisplaySizeY) {
-			logger::info("Transparent Buffer Found : {} x {}", pDesc->Width, pDesc->Height);
-			static int Skip = 1;
-			if (Skip > 0) {
-				Skip--;
-				return hr;
-			}
-			if (SkyrimUpscaler::GetSingleton()->mTransparentMask.mImage != nullptr)
-				return hr;
-			locking = true;
-			SkyrimUpscaler::GetSingleton()->SetupTransparentMask(*ppTexture2D);
-			locking = false;
-		}
-	} else if (pDesc->Format == DXGI_FORMAT_R11G11B10_FLOAT) {
-		if (pDesc->Width == SkyrimUpscaler::GetSingleton()->mDisplaySizeX &&
-			pDesc->Height == SkyrimUpscaler::GetSingleton()->mDisplaySizeY) {
-			logger::info("Opaque Buffer Found : {} x {}", pDesc->Width, pDesc->Height);
-			static int Skip = 1;
-			if (Skip > 0) {
-				Skip--;
-				return hr;
-			}
-			if (SkyrimUpscaler::GetSingleton()->mOpaqueColor.mImage != nullptr)
-				return hr;
-			locking = true;
-			SkyrimUpscaler::GetSingleton()->SetupOpaqueColor(*ppTexture2D);
-			locking = false;
-		}
-	}
-	return hr;
-}
-
-// Mostly from vrperfkit, thanks to fholger for showing how to do mip lod bias
-// https://github.com/fholger/vrperfkit/blob/037c09f3168ac045b5775e8d1a0c8ac982b5854f/src/d3d11/d3d11_post_processor.cpp#L76
-static void SetMipLodBias(ID3D11SamplerState** outSamplers, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState* const* ppSamplers)
-{
-	if (mipLodBias != SkyrimUpscaler::GetSingleton()->mMipLodBias) {
-		logger::info("MIP LOD Bias changed from  {} to {}, recreating samplers", mipLodBias, SkyrimUpscaler::GetSingleton()->mMipLodBias);
-		passThroughSamplers.clear();
-		mappedSamplers.clear();
-		mipLodBias = SkyrimUpscaler::GetSingleton()->mMipLodBias;
-	}
-	memcpy(outSamplers, ppSamplers, NumSamplers * sizeof(ID3D11SamplerState*));
-	for (UINT i = 0; i < NumSamplers; ++i) {
-		auto orig = outSamplers[i];
-		if (orig == nullptr || passThroughSamplers.find(orig) != passThroughSamplers.end()) {
-			continue;
-		}
-		if (mappedSamplers.find(orig) == mappedSamplers.end()) {
-			D3D11_SAMPLER_DESC sd;
-			orig->GetDesc(&sd);
-			if (sd.MipLODBias != 0 || sd.MaxAnisotropy <= 1) {
-				// do not mess with samplers that already have a bias or are not doing anisotropic filtering.
-				// should hopefully reduce the chance of causing rendering errors.
-				passThroughSamplers.insert(orig);
-				continue;
-			}
-			sd.MipLODBias = mipLodBias;
-
-			SkyrimUpscaler::GetSingleton()->mDevice->CreateSamplerState(&sd, &mappedSamplers[orig]);
-			passThroughSamplers.insert(mappedSamplers[orig]);
-		}
-		outSamplers[i] = mappedSamplers[orig];
-	}
-}
-
-void WINAPI hk_ID3D11DeviceContext_PSSetSamplers(ID3D11DeviceContext* This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState* const* ppSamplers)
-{
-	ID3D11SamplerState* samplers[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
-	SetMipLodBias(samplers, StartSlot, NumSamplers, ppSamplers);
-	(This->*ptrPSSetSamplers)(StartSlot, NumSamplers, samplers);
-}
-
-void WINAPI hk_ID3D11DeviceContext_VSSetSamplers(ID3D11DeviceContext* This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState* const* ppSamplers)
-{
-	ID3D11SamplerState* samplers[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
-	SetMipLodBias(samplers, StartSlot, NumSamplers, ppSamplers);
-	(This->*ptrVSSetSamplers)(StartSlot, NumSamplers, samplers);
-}
-
-void WINAPI hk_ID3D11DeviceContext_GSSetSamplers(ID3D11DeviceContext* This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState* const* ppSamplers)
-{
-	ID3D11SamplerState* samplers[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
-	SetMipLodBias(samplers, StartSlot, NumSamplers, ppSamplers);
-	(This->*ptrGSSetSamplers)(StartSlot, NumSamplers, samplers);
-}
-
-void WINAPI hk_ID3D11DeviceContext_HSSetSamplers(ID3D11DeviceContext* This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState* const* ppSamplers)
-{
-	ID3D11SamplerState* samplers[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
-	SetMipLodBias(samplers, StartSlot, NumSamplers, ppSamplers);
-	(This->*ptrHSSetSamplers)(StartSlot, NumSamplers, samplers);
-}
-
-void WINAPI hk_ID3D11DeviceContext_DSSetSamplers(ID3D11DeviceContext* This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState* const* ppSamplers)
-{
-	ID3D11SamplerState* samplers[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
-	SetMipLodBias(samplers, StartSlot, NumSamplers, ppSamplers);
-	(This->*ptrDSSetSamplers)(StartSlot, NumSamplers, samplers);
-}
-
-void WINAPI hk_ID3D11DeviceContext_CSSetSamplers(ID3D11DeviceContext* This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState* const* ppSamplers)
-{
-	ID3D11SamplerState* samplers[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
-	SetMipLodBias(samplers, StartSlot, NumSamplers, ppSamplers);
-	(This->*ptrCSSetSamplers)(StartSlot, NumSamplers, samplers);
+    SettingGUI::GetSingleton()->OnRender();
+    auto hr=(This->*ptrPresent)(SyncInterval,Flags);
+    DRS::GetSingleton()->Update();
+    SkyrimUpscaler::GetSingleton()->mBuild19EarlyAppliedThisFrame=false;
+    return hr;
 }
 
 HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
@@ -364,19 +102,10 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
 	}
 	upscaler->PreInit();
 	SettingGUI::GetSingleton()->InitIMGUI(swapChain, device, deviceContext);
-	InitLogDelegate(MyLog);
 	logger::info("Detouring virtual function tables");
 	*(uintptr_t*)&ptrPresent = Detours::X64::DetourClassVTable(*(uintptr_t*)swapChain, &hk_IDXGISwapChain_Present, 8);
-	*(uintptr_t*)&ptrCreateTexture2D = Detours::X64::DetourClassVTable(*(uintptr_t*)device, &hk_ID3D11Device_CreateTexture2D, 5);
-	*(uintptr_t*)&ptrPSSetSamplers = Detours::X64::DetourClassVTable(*(uintptr_t*)deviceContext, &hk_ID3D11DeviceContext_PSSetSamplers, 10);
-	*(uintptr_t*)&ptrVSSetSamplers = Detours::X64::DetourClassVTable(*(uintptr_t*)deviceContext, &hk_ID3D11DeviceContext_VSSetSamplers, 26);
-	*(uintptr_t*)&ptrGSSetSamplers = Detours::X64::DetourClassVTable(*(uintptr_t*)deviceContext, &hk_ID3D11DeviceContext_GSSetSamplers, 32);
-	*(uintptr_t*)&ptrHSSetSamplers = Detours::X64::DetourClassVTable(*(uintptr_t*)deviceContext, &hk_ID3D11DeviceContext_HSSetSamplers, 61);
-	*(uintptr_t*)&ptrDSSetSamplers = Detours::X64::DetourClassVTable(*(uintptr_t*)deviceContext, &hk_ID3D11DeviceContext_DSSetSamplers, 65);
-	*(uintptr_t*)&ptrCSSetSamplers = Detours::X64::DetourClassVTable(*(uintptr_t*)deviceContext, &hk_ID3D11DeviceContext_CSSetSamplers, 70);
     // ID3D11DeviceContext vtable slots 44/45: observation only, no viewport mutations.
     *(uintptr_t*)&ptrRSSetViewports = Detours::X64::DetourClassVTable(*(uintptr_t*)deviceContext, &hk_ID3D11DeviceContext_RSSetViewports, 44);
-    *(uintptr_t*)&ptrRSSetScissorRects = Detours::X64::DetourClassVTable(*(uintptr_t*)deviceContext, &hk_ID3D11DeviceContext_RSSetScissorRects, 45);
 
 	return hr;
 }
@@ -396,76 +125,37 @@ struct UpscalerHooks
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
 
-	struct Main_DrawWorld_MainDraw
-	{
-		static void thunk(INT64 BSGraphics_Renderer, int unk)
-		{
-			static bool initTAA = false;
-			if (!initTAA) {
-				initTAA = true;
-				UnkOuterStruct::GetSingleton()->SetTAA(SkyrimUpscaler::GetSingleton()->mUpscaleType == TAA);
-				if (SkyrimUpscaler::GetSingleton()->mTargetTex.mImage == nullptr) {
-					ID3D11Texture2D* targetTex;
-					SkyrimUpscaler::GetSingleton()->mSwapChain->GetBuffer(0, IID_PPV_ARGS(&targetTex));
-					SkyrimUpscaler::GetSingleton()->SetupTarget(targetTex);
-				}
-			}
-			auto* upscaler = SkyrimUpscaler::GetSingleton();
-			if (!upscaler->mBuild19EarlyAppliedThisFrame) {
-				upscaler->EvaluateUpscaler();
-			} else if (upscaler->mContext && upscaler->mMotionVectors.mImage &&
-				upscaler->mMotionVectorsEmpty.mImage) {
-				upscaler->mContext->CopyResource(upscaler->mMotionVectors.mImage,
-					upscaler->mMotionVectorsEmpty.mImage);
-			}
-			upscaler->mBuild19EarlyAppliedThisFrame = false;
-			func(BSGraphics_Renderer, unk);
-		}
-		static inline REL::Relocation<decltype(thunk)> func;
-	};
+    struct Main_DrawWorld_MainDraw
+    {
+        static void thunk(INT64 renderer, int unk)
+        {
+            func(renderer, unk);
+        }
+        static inline REL::Relocation<decltype(thunk)> func;
+    };
 
-
-    // Build19: Community Shaders uses this exact pre-image-space call site.
-    // Never call the original late evaluator after successful early dispatch.
+    // Native HDR reconstruction precedes Bethesda's ImageSpace and UI passes.
     struct Main_PostProcessing_Build19
     {
         static void thunk(RE::ImageSpaceManager* a_this, std::uint32_t a3,
             RE::RENDER_TARGET a_target, void* a4, bool a5)
         {
-            auto* upscaler = SkyrimUpscaler::GetSingleton();
-            upscaler->mBuild19EarlyAppliedThisFrame = false;
-            const bool applied = upscaler->EvaluateBeforePostProcessing();
-            upscaler->mBuild19EarlyAppliedThisFrame = applied;
-            if (applied) {
-                // Skyrim now reads an upscaled HDR kMAIN, so its image-space stage
-                // must process the FULL display viewport instead of the DRS rectangle.
-                auto* raw = RE::BSGraphics::State::GetSingleton();
-                if (raw) {
-                    auto* state = reinterpret_cast<BSGraphics::State*>(raw);
-                    auto& runtime = state->GetRuntimeData();
-                    const auto oldWidth = runtime.fDynamicResolutionCurrentWidthScale;
-                    const auto oldHeight = runtime.fDynamicResolutionCurrentHeightScale;
-                    const auto oldPrevWidth = runtime.fDynamicResolutionPreviousWidthScale;
-                    const auto oldPrevHeight = runtime.fDynamicResolutionPreviousHeightScale;
-                    const auto oldRatioWidth = runtime.fDynamicResolutionWidthRatio;
-                    const auto oldRatioHeight = runtime.fDynamicResolutionHeightRatio;
-                    runtime.fDynamicResolutionCurrentWidthScale = 1.0f;
-                    runtime.fDynamicResolutionCurrentHeightScale = 1.0f;
-                    runtime.fDynamicResolutionPreviousWidthScale = 1.0f;
-                    runtime.fDynamicResolutionPreviousHeightScale = 1.0f;
-                    runtime.fDynamicResolutionWidthRatio = 1.0f;
-                    runtime.fDynamicResolutionHeightRatio = 1.0f;
-                    func(a_this, a3, a_target, a4, a5);
-                    runtime.fDynamicResolutionCurrentWidthScale = oldWidth;
-                    runtime.fDynamicResolutionCurrentHeightScale = oldHeight;
-                    runtime.fDynamicResolutionPreviousWidthScale = oldPrevWidth;
-                    runtime.fDynamicResolutionPreviousHeightScale = oldPrevHeight;
-                    runtime.fDynamicResolutionWidthRatio = oldRatioWidth;
-                    runtime.fDynamicResolutionHeightRatio = oldRatioHeight;
-                    return;
+            auto* u=SkyrimUpscaler::GetSingleton();
+            if(!u->mBuild19EarlyAppliedThisFrame && u->EvaluateBeforePostProcessing()) {
+                u->mBuild19EarlyAppliedThisFrame=true;
+                auto* state=RE::BSGraphics::State::GetSingleton();
+                if(state) {
+                    auto& r=state->GetRuntimeData();
+                    r.dynamicResolutionWidthRatio=1.0f;
+                    r.dynamicResolutionHeightRatio=1.0f;
+                    r.dynamicResolutionPreviousWidthRatio=1.0f;
+                    r.dynamicResolutionPreviousHeightRatio=1.0f;
+                    r.dynamicResolutionLock=1;
+                    // Keep full-size ratios through the rest of this frame, including UI.
+                    // The next DRS hook restores the selected world render ratios.
                 }
             }
-            func(a_this, a3, a_target, a4, a5);
+            func(a_this,a3,a_target,a4,a5);
         }
         static inline REL::Relocation<decltype(thunk)> func;
     };
@@ -514,8 +204,9 @@ struct UpscalerHooks
 	{
 		static void thunk(BSGraphics::State* a_state)
 		{
-			func(a_state);
 			auto* upscaler = SkyrimUpscaler::GetSingleton();
+            upscaler->UpdateNativeTAA();
+            func(a_state);
 			const float width = static_cast<float>(upscaler->mRenderSizeX);
 			const float height = static_cast<float>(upscaler->mRenderSizeY);
 			if (upscaler->IsEnabled() && upscaler->mEnableJitter && !upscaler->mDisableEvaluation && upscaler->mUpscaleType != TAA) {
@@ -525,8 +216,8 @@ struct UpscalerHooks
 						logger::error("Jitter cancelled: invalid render size {}x{}", upscaler->mRenderSizeX, upscaler->mRenderSizeY);
 						warnedSize = true;
 					}
-					a_state->jitter[0] = 0.0f;
-					a_state->jitter[1] = 0.0f;
+					reinterpret_cast<RE::BSGraphics::State*>(a_state)->projectionPosScaleX = 0.0f;
+					reinterpret_cast<RE::BSGraphics::State*>(a_state)->projectionPosScaleY = 0.0f;
 					upscaler->SetJitterOffsets(0.0f, 0.0f);
 					return;
 				}
@@ -542,23 +233,22 @@ struct UpscalerHooks
 						logger::error("Jitter cancelled: nonfinite offsets x={} y={} render={}x{}", x, y, width, height);
 						warnedFinite = true;
 					}
-					a_state->jitter[0] = 0.0f;
-					a_state->jitter[1] = 0.0f;
+					reinterpret_cast<RE::BSGraphics::State*>(a_state)->projectionPosScaleX = 0.0f;
+					reinterpret_cast<RE::BSGraphics::State*>(a_state)->projectionPosScaleY = 0.0f;
 					upscaler->SetJitterOffsets(0.0f, 0.0f);
 					return;
 				}
 				static int diagnosticFrames = 0;
 				if (diagnosticFrames++ < 8) {
-					const auto offset = reinterpret_cast<std::uintptr_t>(&a_state->jitter[0]) - reinterpret_cast<std::uintptr_t>(a_state);
+					const auto offset = reinterpret_cast<std::uintptr_t>(&reinterpret_cast<RE::BSGraphics::State*>(a_state)->projectionPosScaleX) - reinterpret_cast<std::uintptr_t>(a_state);
 					logger::info("Jitter frame {}: size={}x{}, raw=({}, {}), normalized=({}, {}), assumedStateOffset=0x{:X}",
 						 diagnosticFrames, width, height, x, y, jitterX, jitterY, offset);
 				}
-				a_state->jitter[0] = jitterX;
-				a_state->jitter[1] = jitterY;
+				reinterpret_cast<RE::BSGraphics::State*>(a_state)->projectionPosScaleX = jitterX;
+				reinterpret_cast<RE::BSGraphics::State*>(a_state)->projectionPosScaleY = jitterY;
 				upscaler->SetJitterOffsets(-x, -y);
 			} else {
-				a_state->jitter[0] = 0.0f;
-				a_state->jitter[1] = 0.0f;
+				if(upscaler->IsEnabled()){reinterpret_cast<RE::BSGraphics::State*>(a_state)->projectionPosScaleX=0.0f;reinterpret_cast<RE::BSGraphics::State*>(a_state)->projectionPosScaleY=0.0f;}
 				upscaler->SetJitterOffsets(0.0f, 0.0f);
 			}
 		}
@@ -604,7 +294,8 @@ struct UpscalerHooks
             // does not resolve to an executable function in this exact runtime.
             const auto site = REL::RelocationID(100430, 107148).address() + REL::Relocate(0x1F0, 0x1E7);
             const auto* call = reinterpret_cast<const std::uint8_t*>(site);
-            bool safeCall = call[0] == 0xE8;
+            const std::uint8_t expected[5]{0xE8, 0x04, 0x2E, 0xFB, 0xFF};
+            bool safeCall = std::memcmp(call, expected, sizeof(expected)) == 0;
             if (safeCall) {
                 std::int32_t disp = 0;
                 std::memcpy(&disp, call + 1, sizeof(disp));

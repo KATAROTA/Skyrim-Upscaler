@@ -93,130 +93,37 @@ void SettingGUI::OnRender()
 		}
 	}
 
-	if (mShowGUI) {
-		// Pass a pointer to our bool variable (the window will have a closing button that will clear the bool when clicked)
-		ImGui::Begin("Skyrim Upscaler Settings", &mShowGUI, ImGuiWindowFlags_NoCollapse);  
-		//ImGui::SetWindowSize(ImVec2(576, 340), 0.9f);
-		if (ImGui::Checkbox("Enable", &SkyrimUpscaler::GetSingleton()->mEnableUpscaler)) {
-			SkyrimUpscaler::GetSingleton()->SetEnabled(SkyrimUpscaler::GetSingleton()->mEnableUpscaler);
-		}
-		ImGui::Checkbox("Disable Evaluation", &SkyrimUpscaler::GetSingleton()->mDisableEvaluation);
-		ImGui::Checkbox("Jitter", &SkyrimUpscaler::GetSingleton()->mEnableJitter);
-		//ImGui::Checkbox("Enable Transparent Mask", &SkyrimUpscaler::GetSingleton()->mEnableTransparentMask);
-		// Reinitializing FSR2 while rendering crashed Wine during the previous test.
-		// These settings are intentionally frozen until a safe reset path exists.
-		ImGui::BeginDisabled();
-		ImGui::Checkbox("Sharpness (restart required)", &SkyrimUpscaler::GetSingleton()->mSharpening);
-		ImGui::DragFloat("Sharpness Amount", &SkyrimUpscaler::GetSingleton()->mSharpness, 0.01f, 0.0f, 5.0f);
-		ImGui::EndDisabled();
-		ImGui::TextDisabled("Edit the INI and restart Skyrim to change sharpening.");
-
-		if (ImGui::Checkbox("Use Optimal Mip Lod Bias", &SkyrimUpscaler::GetSingleton()->mUseOptimalMipLodBias)) {
-			if (SkyrimUpscaler::GetSingleton()->mUseOptimalMipLodBias) {
-				if (SkyrimUpscaler::GetSingleton()->mUpscaleType < DLAA)
-					SkyrimUpscaler::GetSingleton()->mMipLodBias = GetOptimalMipmapBias(0);
-				else
-					SkyrimUpscaler::GetSingleton()->mMipLodBias = 0;
-			}
-		}
-		ImGui::BeginDisabled(SkyrimUpscaler::GetSingleton()->mUseOptimalMipLodBias);
-		ImGui::DragFloat("Mip Lod Bias", &SkyrimUpscaler::GetSingleton()->mMipLodBias, 0.1f, -3.0f, 3.0f);
-		ImGui::EndDisabled();
-
-		std::vector<const char*> imgui_combo_names{};
-		imgui_combo_names.push_back("DLSS");
-		imgui_combo_names.push_back("FSR2");
-		imgui_combo_names.push_back("XeSS");
-		imgui_combo_names.push_back("DLAA");
-		imgui_combo_names.push_back("TAA");
-
-		ImGui::BeginDisabled();
-		ImGui::Combo("Upscale Type", (int*)&SkyrimUpscaler::GetSingleton()->mUpscaleType, imgui_combo_names.data(), imgui_combo_names.size());
-		const auto qualities = (SkyrimUpscaler::GetSingleton()->mUpscaleType == XESS)
-			? "Performance\0Balanced\0Quality\0UltraQuality\0"
-			: "Performance\0Balanced\0Quality\0UltraPerformance\0";
-		ImGui::Combo("Quality Level", (int*)&SkyrimUpscaler::GetSingleton()->mQualityLevel, qualities);
-		ImGui::EndDisabled();
-		ImGui::TextDisabled("Upscale mode / quality: change INI, restart Skyrim.");
-
-		auto* upscaler = SkyrimUpscaler::GetSingleton();
-		const auto w = static_cast<float>(upscaler->mRenderSizeX > 0 ? upscaler->mRenderSizeX : 1);
-		const auto h = static_cast<float>(upscaler->mRenderSizeY > 0 ? upscaler->mRenderSizeY : 1);
-		ImGui::BeginDisabled(!upscaler->mUpscalerReady || (upscaler->mUpscaleType != DLSS && upscaler->mUpscaleType != DLAA));
-		if (ImGui::Checkbox("DEBUG: MetalFX full-size input", &upscaler->mForceMetalFXFullInput)) {
-			logger::info("MetalFX diagnostic input override: {}", upscaler->mForceMetalFXFullInput);
-		}
-		ImGui::EndDisabled();
-		ImGui::TextDisabled("Diagnostic only: full input does not save GPU rendering work.");
-		ImGui::BeginDisabled(!upscaler->mUpscalerReady || upscaler->mUpscaleType != DLSS);
-		ImGui::Checkbox("MetalFX: GPU-resize source (fix zoom)", &upscaler->mUseMetalFXGpuDownsample);
-		ImGui::EndDisabled();
-		ImGui::TextDisabled("Build 16: input image matches declared MetalFX size.");
-        ImGui::BeginDisabled(!upscaler->mUpscalerReady || upscaler->mUpscaleType != DLSS);
-        if (ImGui::Checkbox("ENGINE: try DRS render ratios (experimental)", &upscaler->mTryEngineDRSRatios)) {
-            logger::info("Build17 engine DRS ratio experiment: {}", upscaler->mTryEngineDRSRatios);
+    if (mShowGUI) {
+        auto* u=SkyrimUpscaler::GetSingleton();
+        ImGui::Begin("Skyrim Upscaler - MetalFX", &mShowGUI, ImGuiWindowFlags_NoCollapse);
+        if(u->mNativeFailed) ImGui::TextWrapped("MetalFX unavailable. Vanilla rendering is active. See SkyrimUpscaler.log.");
+        else if(!u->mUpscalerReady) ImGui::TextWrapped("Waiting for a loaded world and validated engine textures.");
+        else ImGui::TextUnformatted(u->IsEnabled()?"MetalFX Temporal active":"Native rendering (MetalFX off)");
+        ImGui::BeginDisabled(!u->mUpscalerReady || u->mNativeFailed);
+        bool enabled=u->mEnableUpscaler;
+        if(ImGui::Checkbox("Enable MetalFX", &enabled)){u->SetEnabled(enabled);u->SaveINI();}
+        int mode=u->mUpscaleType==DLAA?1:0;
+        if(ImGui::Combo("Upscale type", &mode, "DLSS (MetalFX)\0DLAA (MetalFX Native AA)\0")) {
+            if(u->ConfigureNativeMode(mode?DLAA:DLSS,u->mQualityLevel))u->SaveINI();
+        }
+        ImGui::BeginDisabled(u->mUpscaleType==DLAA);
+        int quality=u->mQualityLevel;
+        if(ImGui::Combo("Quality level",&quality,"Performance\0Balanced\0Quality\0")) {
+            if(u->ConfigureNativeMode(u->mUpscaleType,quality))u->SaveINI();
         }
         ImGui::EndDisabled();
-        ImGui::TextDisabled("Build 17: writes Skyrim runtime ratio fields; OFF restores native ratios.");
-        ImGui::BeginDisabled(!upscaler->mUpscalerReady || upscaler->mUpscaleType != DLSS || !upscaler->mTryEngineDRSRatios);
-        if (ImGui::Checkbox("EXPERIMENT: use kMAIN HDR region (Build 18)", &upscaler->mUseBuild18EarlyMain)) {
-            logger::info("Build18 early kMAIN input experiment: {}", upscaler->mUseBuild18EarlyMain);
-        }
+        if(ImGui::Checkbox("Sharpening",&u->mSharpening))u->SaveINI();
+        ImGui::BeginDisabled(!u->mSharpening);
+        ImGui::SliderFloat("Sharpness",&u->mSharpness,0.0f,1.0f,"%.2f");
+        if(ImGui::IsItemDeactivatedAfterEdit())u->SaveINI();
         ImGui::EndDisabled();
-        ImGui::TextDisabled("Experimental colour path; may look different. OFF = Build17 rendering.");
-        ImGui::BeginDisabled(!upscaler->mUpscalerReady || upscaler->mUpscaleType != DLSS ||
-            !upscaler->mTryEngineDRSRatios || !upscaler->mBuild19PostProcessHookInstalled);
-        if (ImGui::Checkbox("Build19: MetalFX BEFORE Skyrim ImageSpace (experimental)", &upscaler->mUseBuild19PrePost)) {
-            if (upscaler->mUseBuild19PrePost)
-                upscaler->mUseBuild18EarlyMain = false;
-            logger::info("Build19 prepost experiment: {}", upscaler->mUseBuild19PrePost);
-        }
         ImGui::EndDisabled();
-        ImGui::TextDisabled("HDR round-trip is approximate. OFF keeps the Build17 path; test colours, zoom, FPS.");
-		ImGui::Checkbox("DEBUG: record DRS viewport/scissor", &upscaler->mTraceRasterStats);
-		ImGui::TextDisabled("Read-only raster probe; logs every 120 presented frames.");
-		ImGui::BeginDisabled(!upscaler->mUpscalerReady);
-
-		if (ImGui::DragFloat("MotionScale X", &SkyrimUpscaler::GetSingleton()->mMotionScale[0], 0.01f, -w, w) ||
-			ImGui::DragFloat("MotionScale Y", &SkyrimUpscaler::GetSingleton()->mMotionScale[1], 0.01f, -h, h)) {
-			SkyrimUpscaler::GetSingleton()->SetMotionScale(SkyrimUpscaler::GetSingleton()->mMotionScale[0], SkyrimUpscaler::GetSingleton()->mMotionScale[1]);
-		}
-		ImGui::EndDisabled();
-
-		ImGui::Spacing();
-		ImGui::Separator();
-		ImGui::Spacing();
-
-		if (sorted_item_list.empty()) {
-			ImGui::TextUnformatted("No motion vectors found.");
-		} else {
-			std::sort(sorted_item_list.begin(), sorted_item_list.end(), [](const motion_item& a, const motion_item& b) {
-				return (a.display_count > b.display_count) ||
-				       (a.display_count == b.display_count && ((a.desc.Width > b.desc.Width || (a.desc.Width == b.desc.Width && a.desc.Height > b.desc.Height)) ||
-																  (a.desc.Width == b.desc.Width && a.desc.Height == b.desc.Height && a.resource < b.resource)));
-			});
-
-			for (const motion_item& item : sorted_item_list) {
-				char label[512] = "";
-				sprintf_s(label, "%c 0x%016llx", ' ', item.resource);
-
-				if (bool value = selected_item.resource == item.resource;
-					ImGui::Checkbox(label, &value)) {
-					if (value) {
-						selected_item = item;
-						SkyrimUpscaler::GetSingleton()->SetupMotionVector(selected_item.resource);
-					}
-				}
-				ImGui::SameLine();
-				ImGui::Text("| %4ux%-4u | %s ",
-					item.desc.Width,
-					item.desc.Height,
-					format_to_string(item.desc.Format));
-			}
-		}
-
-		ImGui::End();
-	}
+        ImGui::Separator();
+        ImGui::Text("Render: %d x %d",u->mRenderSizeX,u->mRenderSizeY);
+        ImGui::Text("Output: %d x %d",u->mDisplaySizeX,u->mDisplaySizeY);
+        ImGui::TextUnformatted("Build 20 | DXMT native temporal scaler");
+        ImGui::End();
+    }
 
 	// Rendering
 	ImGui::Render();

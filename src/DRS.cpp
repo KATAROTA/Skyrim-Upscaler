@@ -1,6 +1,7 @@
 #include "DRS.h"
 
 #include <SkyrimUpscaler.h>
+#include <RE/S/State.h>
 
 void DRS::GetGameSettings()
 {
@@ -52,61 +53,35 @@ void DRS::ResetScale()
 
 void DRS::SetDRS(BSGraphics::State* a_state)
 {
-    if (REL::Module::IsVR()) {
-        SetDRSVR(currentScaleFactor);
+    auto* u=SkyrimUpscaler::GetSingleton();
+    ControlResolution();
+    const bool active=u->IsEnabled() && u->mDisplaySizeX>0 && u->mDisplaySizeY>0;
+    const float x=active?float(u->mRenderSizeX)/u->mDisplaySizeX:1.0f;
+    const float y=active?float(u->mRenderSizeY)/u->mDisplaySizeY:1.0f;
+    auto* state=reinterpret_cast<RE::BSGraphics::State*>(a_state);
+    auto& r=state->GetRuntimeData();
+    // CommonLib's versioned accessor uses State+0x70 on 1.7.104.
+    // The legacy custom layout used +0x60 and overwrote Halton entries.
+    static bool layoutLogged=false;
+    if(!layoutLogged){
+        layoutLogged=true;
+        const auto off=reinterpret_cast<std::uintptr_t>(&r)-reinterpret_cast<std::uintptr_t>(state);
+        logger::info("Build20 State runtime offset=0x{:X}",off);
     }
-
-    auto& runtimeData = a_state->GetRuntimeData();
-    const float oldWidth = runtimeData.fDynamicResolutionCurrentWidthScale;
-    const float oldHeight = runtimeData.fDynamicResolutionCurrentHeightScale;
-    const float oldRatioX = runtimeData.fDynamicResolutionWidthRatio;
-    const float oldRatioY = runtimeData.fDynamicResolutionHeightRatio;
-
-    // Build 16 wrote only CurrentWidth/HeightScale. In Community Shaders,
-    // Skyrim's upscaling path additionally writes the runtime Width/HeightRatio
-    // and their previous-frame counterparts. Probe these fields ONLY when opted in.
-    auto* upscaler = SkyrimUpscaler::GetSingleton();
-    const bool experimental = upscaler->mTryEngineDRSRatios &&
-        upscaler->mUpscalerReady && upscaler->mUpscaleType == DLSS;
-    static bool wasExperimental = false;
-    const float scale = (currentScaleFactor >= 0.5f && currentScaleFactor <= 1.0f)
-        ? currentScaleFactor : 1.0f;
-    const float effectiveRatio = experimental ? scale : 1.0f;
-
-    runtimeData.fDynamicResolutionCurrentWidthScale = scale;
-    runtimeData.fDynamicResolutionCurrentHeightScale = scale;
-
-    if (experimental || wasExperimental) {
-        // Keep previous ratios synchronized with the values used in the prior frame.
-        // When the experiment is switched off, restore 1.0 without restarting Skyrim.
-        runtimeData.fDynamicResolutionPreviousWidthScale = oldRatioX;
-        runtimeData.fDynamicResolutionPreviousHeightScale = oldRatioY;
-        runtimeData.fDynamicResolutionWidthRatio = effectiveRatio;
-        runtimeData.fDynamicResolutionHeightRatio = effectiveRatio;
-    }
-
-    static int diagnosticFrames = 0;
-    static float lastDiagnosticScale = -1.0f;
-    static bool lastExperimental = false;
-    if (lastDiagnosticScale != scale || lastExperimental != experimental) {
-        lastDiagnosticScale = scale;
-        lastExperimental = experimental;
-        diagnosticFrames = 0;
-    }
-    if (diagnosticFrames++ < 8) {
-        logger::info("Build17 DRS: experimental={} requested={} current {}x{} -> {}x{} ratio {}x{} -> {}x{} previous={}x{} stateOffset=0x{:X}",
-            experimental, scale, oldWidth, oldHeight,
-            runtimeData.fDynamicResolutionCurrentWidthScale,
-            runtimeData.fDynamicResolutionCurrentHeightScale,
-            oldRatioX, oldRatioY,
-            runtimeData.fDynamicResolutionWidthRatio,
-            runtimeData.fDynamicResolutionHeightRatio,
-            runtimeData.fDynamicResolutionPreviousWidthScale,
-            runtimeData.fDynamicResolutionPreviousHeightScale,
-            static_cast<unsigned int>(reinterpret_cast<std::uintptr_t>(&runtimeData) - reinterpret_cast<std::uintptr_t>(a_state)));
-    }
-    wasExperimental = experimental;
-    lastScaleFactor = scale;
+    const auto off=reinterpret_cast<std::uintptr_t>(&r)-reinterpret_cast<std::uintptr_t>(state);
+    if(off!=0x70){u->mNativeFailed=true;u->mUpscalerReady=false;u->SetEnabled(false);return;}
+    static float previousX=1.0f,previousY=1.0f;
+    static bool wasActive=false;
+    static std::int32_t savedLock=0;
+    if(active&&!wasActive)savedLock=r.dynamicResolutionLock;
+    if(active)r.dynamicResolutionLock=1;
+    else if(wasActive)r.dynamicResolutionLock=savedLock;
+    r.dynamicResolutionPreviousWidthRatio=previousX;
+    r.dynamicResolutionPreviousHeightRatio=previousY;
+    r.dynamicResolutionWidthRatio=x;
+    r.dynamicResolutionHeightRatio=y;
+    if(previousX!=x||previousY!=y)logger::info("Build20 engine DRS: {}x{} -> {}x{}",previousX,previousY,x,y);
+    previousX=x;previousY=y;lastScaleFactor=x;currentScaleFactor=x;wasActive=active;
 }
 
 void DRS::MessageHandler(SKSE::MessagingInterface::Message* a_msg)
@@ -131,6 +106,7 @@ RE::BSEventNotifyControl MenuOpenCloseEventHandler::ProcessEvent(const RE::MenuO
 		if (a_event->opening) {
 			DRS::GetSingleton()->reset = true;
 			DRS::GetSingleton()->ResetScale();
+            SkyrimUpscaler::GetSingleton()->ResetNativeHistory();
 		} else {
 			DRS::GetSingleton()->reset = false;
 			DRS::GetSingleton()->ControlResolution();

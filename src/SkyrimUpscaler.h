@@ -6,6 +6,7 @@
 #include <SimpleIni.h>
 #include <d3d11_4.h>
 #include <SettingGUI.h>
+#include <atomic>
 
 struct UnkOuterStruct
 {
@@ -27,14 +28,14 @@ struct UnkOuterStruct
 
 	bool GetTAA() const
 	{
-		if (this == nullptr)
+		if (this == nullptr || unkInnerStruct == nullptr)
 			return false;
 		return unkInnerStruct->bTAA;
 	}
 
 	void SetTAA(bool a_enabled)
 	{
-		if (this == nullptr)
+		if (this == nullptr || unkInnerStruct == nullptr)
 			return;
 		unkInnerStruct->bTAA = a_enabled;
 	}
@@ -106,8 +107,18 @@ public:
 	//Reserve the second value for VR
 	bool  mEnableUpscaler = false;
 	bool  mUpscalerReady{ false };
+    bool mNativeAvailable{ false };
+    bool mNativeFailed{ false };
+    bool mNativeTAAKnown{ false };
+    bool mNativeOriginalTAA{ true };
+    bool mNativeHistoryReset{ true };
+    std::atomic<bool> mNativeViewportSeen{ false };
+    unsigned mNativeViewportWait{ 0 };
+    bool ConfigureNativeMode(int mode, int quality);
+    void UpdateNativeTAA();
+    void ResetNativeHistory();
 	float mJitterIndex{0};
-	float mJitterOffsets[2];
+	float mJitterOffsets[2]{ 0.0f, 0.0f };
 	float mMotionScale[2]{ 0, 0 };
 	bool  mSharpening{ false };
 	float mSharpness{ 0.3f };
