@@ -132,11 +132,6 @@ if (CMAKE_GENERATOR MATCHES "Visual Studio")
 			"$<$<CONFIG:RELEASE>:/LTCG;/INCREMENTAL:NO;/OPT:REF;/OPT:ICF;/DEBUG:FULL>"
 	)
 
-	set(list_of_dlls PDPerfPlugin.dll)
-	foreach(dll_name ${list_of_dlls})
-	   set(space_separated_list "${space_separated_list} /DELAYLOAD:${dll_name}")
-	endforeach()
-	set_target_properties(${PROJECT_NAME}  PROPERTIES LINK_FLAGS "${space_separated_list}")
 endif()
 
 find_package(nlohmann_json CONFIG REQUIRED)
@@ -167,8 +162,6 @@ if (BUILD_SKYRIM)
 			magic_enum::magic_enum
 			debug ${CMAKE_CURRENT_SOURCE_DIR}/extern/detours/x64/Debug/detours.lib
 			optimized ${CMAKE_CURRENT_SOURCE_DIR}/extern/detours/x64/Release/detours.lib
-			debug ${CMAKE_CURRENT_SOURCE_DIR}/extern/PDPerfPlugin.lib
-			optimized ${CMAKE_CURRENT_SOURCE_DIR}/extern/PDPerfPlugin.lib
 	)
 else()
 	add_subdirectory(${CommonLibPath} ${CommonLibName} EXCLUDE_FROM_ALL)
