@@ -35,6 +35,8 @@ struct __declspec(uuid("19a8e35a-38be-418f-94e3-9f7323936870")) ContextExt1 : Co
 struct Source {
     ID3D11Texture2D *color{}, *depth{}, *motion{};
     ID3D11ShaderResourceView *colorSRV{}, *depthSRV{}, *motionSRV{};
+    ID3D11RenderTargetView* colorRTV{};
+    ID3D11DepthStencilView* depthDSV{};
     D3D11_TEXTURE2D_DESC colorDesc{}, depthDesc{}, motionDesc{};
 };
 inline bool SameResource(ID3D11View* view, ID3D11Texture2D* texture) {
@@ -56,6 +58,8 @@ inline bool GetSource(Source& s, UINT w, UINT h) {
     s.colorSRV = reinterpret_cast<ID3D11ShaderResourceView*>(color.SRV);
     s.depthSRV = reinterpret_cast<ID3D11ShaderResourceView*>(depth.depthSRV);
     s.motionSRV = reinterpret_cast<ID3D11ShaderResourceView*>(motion.SRV);
+    s.colorRTV = reinterpret_cast<ID3D11RenderTargetView*>(color.RTV);
+    s.depthDSV = reinterpret_cast<ID3D11DepthStencilView*>(depth.views[0]);
     if (!s.color || !s.depth || !s.motion || !s.colorSRV || !s.depthSRV || !s.motionSRV) return false;
     if (!SameResource(s.colorSRV, s.color) || !SameResource(s.depthSRV, s.depth) || !SameResource(s.motionSRV, s.motion)) return false;
     s.color->GetDesc(&s.colorDesc); s.depth->GetDesc(&s.depthDesc); s.motion->GetDesc(&s.motionDesc);
@@ -66,6 +70,66 @@ inline bool GetSource(Source& s, UINT w, UINT h) {
         s.colorDesc.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
         s.depthDesc.Format == DXGI_FORMAT_R24G8_TYPELESS &&
         s.motionDesc.Format == DXGI_FORMAT_R16G16_FLOAT;
+}
+
+// A direct resolve may displace SRVs which alias kMAIN or its depth.
+// Preserve only those slots, across all shader stages. PS t0-t2 are already
+// handled by GraphicsState. Explicitly unbind conflicts before the direct draw.
+struct ResolveAliases {
+    using Getter=decltype(&ID3D11DeviceContext::PSGetShaderResources);
+    using Setter=decltype(&ID3D11DeviceContext::PSSetShaderResources);
+    struct Slot { Setter set{}; UINT index{}; ID3D11ShaderResourceView* view{}; };
+    ID3D11DeviceContext* c;
+    std::array<Slot,6*D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> saved{};
+    UINT used=0;
+    bool unbound=false;
+    ResolveAliases(ID3D11DeviceContext* context,const Source& s,bool direct):c(context) {
+        if(!direct)return;
+        Capture(&ID3D11DeviceContext::PSGetShaderResources,&ID3D11DeviceContext::PSSetShaderResources,s,3);
+        Capture(&ID3D11DeviceContext::VSGetShaderResources,&ID3D11DeviceContext::VSSetShaderResources,s,0);
+        Capture(&ID3D11DeviceContext::GSGetShaderResources,&ID3D11DeviceContext::GSSetShaderResources,s,0);
+        Capture(&ID3D11DeviceContext::HSGetShaderResources,&ID3D11DeviceContext::HSSetShaderResources,s,0);
+        Capture(&ID3D11DeviceContext::DSGetShaderResources,&ID3D11DeviceContext::DSSetShaderResources,s,0);
+        Capture(&ID3D11DeviceContext::CSGetShaderResources,&ID3D11DeviceContext::CSSetShaderResources,s,0);
+    }
+    void Capture(Getter get,Setter set,const Source& s,UINT first) {
+        constexpr UINT slots=D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+        ID3D11ShaderResourceView* views[slots]{};
+        (c->*get)(first,slots-first,views);
+        for(UINT i=0;i<slots-first;++i) {
+            auto* view=views[i];
+            if(!view)continue;
+            ComPtr<ID3D11Resource> resource;
+            view->GetResource(resource.GetAddressOf());
+            if(resource.Get()==static_cast<ID3D11Resource*>(s.color)||resource.Get()==static_cast<ID3D11Resource*>(s.depth))
+                saved[used++]={set,i+first,view};
+            else view->Release();
+        }
+    }
+    void Unbind() {
+        ID3D11ShaderResourceView* empty=nullptr;
+        for(UINT i=0;i<used;++i)(c->*saved[i].set)(saved[i].index,1,&empty);
+        unbound=true;
+    }
+    ~ResolveAliases() {
+        // Constructed before GraphicsState: engine OM bindings are restored first.
+        for(UINT i=0;i<used;++i) {
+            auto& slot=saved[i];
+            if(unbound)(c->*slot.set)(slot.index,1,&slot.view);
+            slot.view->Release();
+        }
+    }
+    ResolveAliases(const ResolveAliases&)=delete;
+    ResolveAliases& operator=(const ResolveAliases&)=delete;
+};
+
+inline bool CanResolveDirect(const Source& s) {
+    if(!SameResource(s.colorRTV,s.color)||!SameResource(s.depthDSV,s.depth))return false;
+    D3D11_RENDER_TARGET_VIEW_DESC r{};s.colorRTV->GetDesc(&r);
+    D3D11_DEPTH_STENCIL_VIEW_DESC d{};s.depthDSV->GetDesc(&d);
+    return r.Format==DXGI_FORMAT_R11G11B10_FLOAT && r.ViewDimension==D3D11_RTV_DIMENSION_TEXTURE2D && r.Texture2D.MipSlice==0 &&
+        d.Format==DXGI_FORMAT_D24_UNORM_S8_UINT && d.ViewDimension==D3D11_DSV_DIMENSION_TEXTURE2D && d.Texture2D.MipSlice==0 &&
+        !(d.Flags&D3D11_DSV_READ_ONLY_DEPTH);
 }
 
 // Isolate the two fullscreen passes. No writes to engine resources occur
@@ -278,6 +342,8 @@ public:
         ctx->OMGetRenderTargetsAndUnorderedAccessViews(0,nullptr,nullptr,0,8,uavs);
         bool occupied=false;for(auto* v:uavs)if(v){occupied=true;v->Release();}
         if(occupied){logger::error("Build20 prepost has active OM UAV; aborting native pass");return false;}
+        const bool direct=(b.w!=outW||b.h!=outH)&&CanResolveDirect(s);
+        ResolveAliases aliases(ctx.Get(),s,direct);
         GraphicsState guard(ctx.Get());
         ClearBindings();
         ctx->SetPredication(nullptr,FALSE);
@@ -299,17 +365,23 @@ public:
         if(resetHistory){const FLOAT zero[4]{};ctx->ClearUnorderedAccessViewFloat(b.outputUAV.Get(),zero);}
         ext->TemporalUpscale(&d);
         // DXMT's method returns void; its GPU execution cannot be verified by HRESULT.
-        // Preserve original stencil bits; replace depth values and HDR color in scratch targets.
-        ctx->CopyResource(b.fullDepth.Get(),s.depth);
+        // Input color/depth have already been captured into independent textures.
+        // Resolve directly to the engine's validated views; depth writes leave stencil intact.
+        // Keep the Build20 scratch path when direct resolve is not safe.
+        if(direct)aliases.Unbind();
+        else ctx->CopyResource(b.fullDepth.Get(),s.depth);
         View(outW,outH);
-        auto* out=b.resolvedRTV.Get();ctx->OMSetRenderTargets(1,&out,b.fullDepthDSV.Get());
+        auto* out=direct?s.colorRTV:b.resolvedRTV.Get();
+        ctx->OMSetRenderTargets(1,&out,direct?s.depthDSV:b.fullDepthDSV.Get());
         ID3D11ShaderResourceView* resolveSrc[]{b.outputSRV.Get(),b.depthSRV.Get(),b.inputSRV.Get()};
         ctx->PSSetShaderResources(0,3,resolveSrc);
         Params params{b.w,b.h,outW,outH,std::clamp(sharp,0.0f,1.0f),{0,0,0}};
         ctx->UpdateSubresource(constants.Get(),0,nullptr,&params,0,0);auto* cb=constants.Get();ctx->PSSetConstantBuffers(0,1,&cb);
         ctx->PSSetShader(resolvePS.Get(),nullptr,0);ctx->Draw(3,0);ClearBindings();
-        ctx->CopyResource(s.color,b.resolved.Get());ctx->CopyResource(s.depth,b.fullDepth.Get());
-        if(frames++<3||resetHistory)logger::info("Build20 native MetalFX SUBMITTED: {}x{} -> {}x{}, reset={}, sharpness={}",b.w,b.h,outW,outH,resetHistory,sharp);
+        if(!direct) {
+            ctx->CopyResource(s.color,b.resolved.Get());ctx->CopyResource(s.depth,b.fullDepth.Get());
+        }
+        if(frames++<3||resetHistory)logger::info("Build21 native MetalFX SUBMITTED: {}x{} -> {}x{}, reset={}, sharpness={}, directResolve={}",b.w,b.h,outW,outH,resetHistory,sharp,direct);
         resetHistory=false;return true;
     }
 };

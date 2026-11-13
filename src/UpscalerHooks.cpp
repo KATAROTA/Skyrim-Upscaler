@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <RE/S/State.h>
+#include <RE/R/Renderer.h>
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChain;
 decltype(&IDXGISwapChain::Present) ptrPresent;
@@ -158,8 +159,18 @@ struct UpscalerHooks
                     r.dynamicResolutionPreviousWidthRatio=1.0f;
                     r.dynamicResolutionPreviousHeightRatio=1.0f;
                     r.dynamicResolutionLock=1;
-                    // Keep full-size ratios through the rest of this frame, including UI.
-                    // The next DRS hook restores the selected world render ratios.
+                    // The DRS ratios alone do not refresh Skyrim's cached PerFrame data.
+                    // The pinned CommonLib exposes the correct 1.7.104 member ABI.
+                    if(u->mUpscaleType==DLSS) {
+                        if(auto* renderer=RE::BSGraphics::Renderer::GetSingleton()) {
+                            renderer->UpdateViewPort(0,0,true);
+                            renderer->UpdateCameraData(0);
+                            static unsigned refreshLogs=0;
+                            if(refreshLogs++<8)
+                                logger::info("Build21 post camera refreshed: full {}x{} DRS=1 lock=1",u->mDisplaySizeX,u->mDisplaySizeY);
+                        }
+                    }
+                    // Next frame's DRS hook restores the selected world render ratios.
                 }
             }
             func(a_this,a3,a_target,a4,a5);
@@ -349,4 +360,3 @@ struct UpscalerHooks
 void InstallUpscalerHooks() {
 	UpscalerHooks::Install();
 }
-

@@ -121,7 +121,7 @@ void SettingGUI::OnRender()
         ImGui::Separator();
         ImGui::Text("Render: %d x %d",u->mRenderSizeX,u->mRenderSizeY);
         ImGui::Text("Output: %d x %d",u->mDisplaySizeX,u->mDisplaySizeY);
-        ImGui::TextUnformatted("Build 20 | DXMT native temporal scaler");
+        ImGui::TextUnformatted("Build 21 | DXMT native temporal scaler");
         ImGui::End();
     }
 
