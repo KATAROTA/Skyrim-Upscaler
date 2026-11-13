@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <utility>
 
@@ -38,6 +39,26 @@ struct Source {
     ID3D11RenderTargetView* colorRTV{};
     ID3D11DepthStencilView* depthDSV{};
     D3D11_TEXTURE2D_DESC colorDesc{}, depthDesc{}, motionDesc{};
+    bool directCapable{};
+};
+inline bool CanResolveDirect(const Source& s);
+struct SourceCache {
+    Source value{};
+    std::array<ComPtr<ID3D11Texture2D>,3> textures;
+    std::array<ComPtr<ID3D11View>,5> views;
+    bool valid=false;
+    bool Matches(const Source& s, UINT w, UINT h) const {
+        return valid && value.colorDesc.Width==w && value.colorDesc.Height==h &&
+            value.color==s.color && value.depth==s.depth && value.motion==s.motion &&
+            value.colorSRV==s.colorSRV && value.depthSRV==s.depthSRV && value.motionSRV==s.motionSRV &&
+            value.colorRTV==s.colorRTV && value.depthDSV==s.depthDSV;
+    }
+    void Store(const Source& s) {
+        textures[0]=s.color; textures[1]=s.depth; textures[2]=s.motion;
+        views[0]=s.colorSRV; views[1]=s.depthSRV; views[2]=s.motionSRV;
+        views[3]=s.colorRTV; views[4]=s.depthDSV;
+        value=s; valid=true;
+    }
 };
 inline bool SameResource(ID3D11View* view, ID3D11Texture2D* texture) {
     if (!view || !texture) return false;
@@ -60,16 +81,21 @@ inline bool GetSource(Source& s, UINT w, UINT h) {
     s.motionSRV = reinterpret_cast<ID3D11ShaderResourceView*>(motion.SRV);
     s.colorRTV = reinterpret_cast<ID3D11RenderTargetView*>(color.RTV);
     s.depthDSV = reinterpret_cast<ID3D11DepthStencilView*>(depth.views[0]);
+    static SourceCache cache;
+    if (cache.Matches(s,w,h)) { s=cache.value; return true; }
+    cache=SourceCache{};
     if (!s.color || !s.depth || !s.motion || !s.colorSRV || !s.depthSRV || !s.motionSRV) return false;
     if (!SameResource(s.colorSRV, s.color) || !SameResource(s.depthSRV, s.depth) || !SameResource(s.motionSRV, s.motion)) return false;
     s.color->GetDesc(&s.colorDesc); s.depth->GetDesc(&s.depthDesc); s.motion->GetDesc(&s.motionDesc);
     auto valid = [&](const D3D11_TEXTURE2D_DESC& d) {
         return d.Width == w && d.Height == h && d.SampleDesc.Count == 1 && d.ArraySize == 1 && d.MipLevels == 1;
     };
-    return valid(s.colorDesc) && valid(s.depthDesc) && valid(s.motionDesc) &&
+    const bool supported=valid(s.colorDesc) && valid(s.depthDesc) && valid(s.motionDesc) &&
         s.colorDesc.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
         s.depthDesc.Format == DXGI_FORMAT_R24G8_TYPELESS &&
         s.motionDesc.Format == DXGI_FORMAT_R16G16_FLOAT;
+    if(supported) { s.directCapable=CanResolveDirect(s); cache.Store(s); }
+    return supported;
 }
 
 // A direct resolve may displace SRVs which alias kMAIN or its depth.
@@ -190,6 +216,45 @@ struct Buffers {
 struct alignas(16) Params { UINT iw,ih,ow,oh; FLOAT sharp, padding[3]; };
 static_assert(sizeof(Params)==32);
 
+struct CpuProfile {
+    using Clock=std::chrono::steady_clock;
+    struct Totals {
+        UINT w{},h{};
+        float sharp{};
+        bool direct{};
+        unsigned count{};
+        std::array<double,5> us{};
+    };
+    UINT w,h;
+    float sharp;
+    bool direct;
+    Clock::time_point last=Clock::now();
+    std::array<double,5> elapsed{};
+    unsigned stage=0;
+    explicit CpuProfile(UINT width,UINT height,float amount,bool fast):w(width),h(height),sharp(amount),direct(fast) {}
+    void Mark() {
+        const auto now=Clock::now();
+        if(stage<elapsed.size()) elapsed[stage++]=std::chrono::duration<double,std::micro>(now-last).count();
+        last=now;
+    }
+    ~CpuProfile() {
+        if(stage!=4)return;
+        Mark(); // state/alias restoration has completed before this destructor
+        static Totals totals;
+        if(totals.w!=w||totals.h!=h||totals.sharp!=sharp||totals.direct!=direct) {
+            totals=Totals{};totals.w=w;totals.h=h;totals.sharp=sharp;totals.direct=direct;
+        }
+        for(unsigned i=0;i<5;++i)totals.us[i]+=elapsed[i];
+        if(++totals.count==240) {
+            const double n=totals.count;
+            const double total=totals.us[0]+totals.us[1]+totals.us[2]+totals.us[3]+totals.us[4];
+            logger::info("Build22 CPU submit {}x{} sharp={} direct={}: capture={:.1f}us prepare={:.1f}us dispatch={:.1f}us resolve={:.1f}us restore={:.1f}us total={:.1f}us ({} frames)",
+                w,h,sharp,direct,totals.us[0]/n,totals.us[1]/n,totals.us[2]/n,totals.us[3]/n,totals.us[4]/n,total/n,totals.count);
+            totals.count=0;totals.us.fill(0.0);
+        }
+    }
+};
+
 class NativeMetalFX {
     ComPtr<ContextExt1> ext;
     ComPtr<ID3D11Device> dev;
@@ -200,6 +265,8 @@ class NativeMetalFX {
     ComPtr<ID3D11DepthStencilState> depthWrite;
     ComPtr<ID3D11BlendState> blend;
     ComPtr<ID3D11Buffer> constants;
+    Params lastParams{};
+    bool paramsValid=false;
     Buffers b;
     UINT outW{},outH{};
     bool resetHistory=true;
@@ -295,7 +362,7 @@ Result main(float4 p:SV_Position) {
 public:
     bool Init(ID3D11Device* device,ID3D11DeviceContext* context,UINT w,UINT h) {
         if(!device||!context||!w||!h)return false;
-        dev=device;ctx=context;outW=w;outH=h;
+        dev=device;ctx=context;outW=w;outH=h;paramsValid=false;
         if(!Check(ctx->QueryInterface(__uuidof(ContextExt1),reinterpret_cast<void**>(ext.GetAddressOf())),"DXMT context interface"))return false;
         BOOL supported=FALSE;
         if(!Check(ext->CheckFeatureSupport(0,&supported,sizeof(supported)),"MetalFX feature support")||!supported)return false;
@@ -342,10 +409,19 @@ public:
         ctx->OMGetRenderTargetsAndUnorderedAccessViews(0,nullptr,nullptr,0,8,uavs);
         bool occupied=false;for(auto* v:uavs)if(v){occupied=true;v->Release();}
         if(occupied){logger::error("Build20 prepost has active OM UAV; aborting native pass");return false;}
-        const bool direct=(b.w!=outW||b.h!=outH)&&CanResolveDirect(s);
+        const bool direct=(b.w!=outW||b.h!=outH)&&s.directCapable;
+        CpuProfile profile(b.w,b.h,sharp,direct);
         ResolveAliases aliases(ctx.Get(),s,direct);
         GraphicsState guard(ctx.Get());
+        profile.Mark();
         ClearBindings();
+        // DXMT implements UpdateSubresource on a DEFAULT buffer as a staging
+        // blit. Upload only when values change, before (not after) MetalFX.
+        const Params params{b.w,b.h,outW,outH,std::clamp(sharp,0.0f,1.0f),{0,0,0}};
+        if(!paramsValid || std::memcmp(&params,&lastParams,sizeof(Params))!=0) {
+            ctx->UpdateSubresource(constants.Get(),0,nullptr,&params,0,0);
+            lastParams=params;paramsValid=true;
+        }
         ctx->SetPredication(nullptr,FALSE);
         ctx->IASetInputLayout(nullptr);ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->VSSetShader(vs.Get(),nullptr,0);ctx->GSSetShader(nullptr,nullptr,0);ctx->HSSetShader(nullptr,nullptr,0);ctx->DSSetShader(nullptr,nullptr,0);
@@ -357,6 +433,7 @@ public:
         ID3D11ShaderResourceView* src[]{s.colorSRV,s.motionSRV,s.depthSRV};
         ctx->PSSetShaderResources(0,3,src);ctx->PSSetShader(preparePS.Get(),nullptr,0);ctx->Draw(3,0);
         ClearBindings();
+        profile.Mark();
         TemporalDesc d{};d.InputContentWidth=b.w;d.InputContentHeight=b.h;
         d.AutoExposure=TRUE;d.InReset=resetHistory?TRUE:FALSE;d.DepthReversed=FALSE;d.MotionVectorInDisplayRes=FALSE;
         d.Color=b.input.Get();d.Depth=b.depth.Get();d.MotionVector=b.motion.Get();d.Output=b.output.Get();
@@ -364,6 +441,7 @@ public:
         d.JitterOffsetX=jx;d.JitterOffsetY=jy;
         if(resetHistory){const FLOAT zero[4]{};ctx->ClearUnorderedAccessViewFloat(b.outputUAV.Get(),zero);}
         ext->TemporalUpscale(&d);
+        profile.Mark();
         // DXMT's method returns void; its GPU execution cannot be verified by HRESULT.
         // Input color/depth have already been captured into independent textures.
         // Resolve directly to the engine's validated views; depth writes leave stencil intact.
@@ -375,13 +453,13 @@ public:
         ctx->OMSetRenderTargets(1,&out,direct?s.depthDSV:b.fullDepthDSV.Get());
         ID3D11ShaderResourceView* resolveSrc[]{b.outputSRV.Get(),b.depthSRV.Get(),b.inputSRV.Get()};
         ctx->PSSetShaderResources(0,3,resolveSrc);
-        Params params{b.w,b.h,outW,outH,std::clamp(sharp,0.0f,1.0f),{0,0,0}};
-        ctx->UpdateSubresource(constants.Get(),0,nullptr,&params,0,0);auto* cb=constants.Get();ctx->PSSetConstantBuffers(0,1,&cb);
+        auto* cb=constants.Get();ctx->PSSetConstantBuffers(0,1,&cb);
         ctx->PSSetShader(resolvePS.Get(),nullptr,0);ctx->Draw(3,0);ClearBindings();
         if(!direct) {
             ctx->CopyResource(s.color,b.resolved.Get());ctx->CopyResource(s.depth,b.fullDepth.Get());
         }
-        if(frames++<3||resetHistory)logger::info("Build21 native MetalFX SUBMITTED: {}x{} -> {}x{}, reset={}, sharpness={}, directResolve={}",b.w,b.h,outW,outH,resetHistory,sharp,direct);
+        profile.Mark();
+        if(frames++<3||resetHistory)logger::info("Build22 native MetalFX SUBMITTED: {}x{} -> {}x{}, reset={}, sharpness={}, directResolve={}",b.w,b.h,outW,outH,resetHistory,sharp,direct);
         resetHistory=false;return true;
     }
 };

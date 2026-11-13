@@ -15,6 +15,7 @@ on:
       - experiment-metalfx-prepost-b19
       - metalfx-native-b20
       - metalfx-native-b21
+      - metalfx-native-b22
   workflow_dispatch:
 
 jobs:

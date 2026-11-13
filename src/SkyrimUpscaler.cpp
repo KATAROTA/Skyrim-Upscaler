@@ -147,6 +147,7 @@ bool SkyrimUpscaler::EvaluateBeforePostProcessing()
 {
     if (!mNativeAvailable || mNativeFailed || !mBuild19PostProcessHookInstalled) return false;
     if (DRS::GetSingleton()->reset) { ResetNativeHistory(); return false; }
+    if (mUpscalerReady && !IsEnabled()) return false;
     b20::Source s;
     const bool valid = b20::GetSource(s, static_cast<UINT>(mDisplaySizeX), static_cast<UINT>(mDisplaySizeY));
     if (!mUpscalerReady) {
